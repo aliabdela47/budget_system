@@ -1,9 +1,27 @@
 <?php
 require_once 'includes/init.php';
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] != 'admin') {
+require_once 'includes/sidebar.php';
+
+require_admin(); // Admin only
+// session_start();
+// include 'includes/db.php';
+//require_once 'includes/functions.php';
+//require_once DIR . '/includes/functions.php';
+if (($_SESSION['role'] ?? '') !== 'admin') {
+    $_SESSION['flash_error'] = 'You are not authorized to access that page.';
     header('Location: dashboard.php');
     exit;
 }
+
+
+$is_officer = ($_SESSION['role'] == 'officer');
+
+// Fetch user's name from database
+$user_id = $_SESSION['user_id'];
+$stmt = $pdo->prepare("SELECT name FROM users WHERE id = ?");
+$stmt->execute([$user_id]);
+$user_data = $stmt->fetch(PDO::FETCH_ASSOC);
+$user_name = $user_data['name'] ?? $_SESSION['username'];
 
 // Create uploads directory if it doesn't exist
 if (!file_exists('uploads')) {
@@ -21,7 +39,6 @@ if (isset($_GET['action']) && $_GET['action'] == 'edit' && isset($_GET['id'])) {
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $username = $_POST['username'];
     $name = $_POST['name'];
-// ... then in the INSERT and UPDATE queries, include the name field.
     $password = !empty($_POST['password']) ? password_hash($_POST['password'], PASSWORD_DEFAULT) : null;
     $role = $_POST['role'];
     
@@ -67,22 +84,22 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
         } else {
             if ($profilePicture) {
-                $stmt = $pdo->prepare("UPDATE users SET username = ?, role = ?, name = ?, profile_picture = ? WHERE id = ?");
+                $stmt = $pdo->prepare("UPDATE users SET username = ?, name = ?, role = ?, profile_picture = ? WHERE id = ?");
                 $stmt->execute([$username, $name, $role, $profilePicture, $_POST['id']]);
             } else {
                 $stmt = $pdo->prepare("UPDATE users SET username = ?, name = ?, role = ? WHERE id = ?");
                 $stmt->execute([$username, $name, $role, $_POST['id']]);
             }
         }
-        $message = 'User updated';
+        $message = 'User updated successfully';
     } else {
         // For new users, password is required
         if (!$password) {
             $message = 'Password is required for new users';
         } else {
-            $stmt = $pdo->prepare("INSERT INTO users (username, name, password_hash, role, profile_picture) VALUES (?, ?, ?, ?)");
+            $stmt = $pdo->prepare("INSERT INTO users (username, name, password_hash, role, profile_picture) VALUES (?, ?, ?, ?, ?)");
             $stmt->execute([$username, $name, $password, $role, $profilePicture]);
-            $message = 'User added';
+            $message = 'User added successfully';
         }
     }
 }
@@ -99,7 +116,7 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
     
     $stmt = $pdo->prepare("DELETE FROM users WHERE id = ?");
     $stmt->execute([$_GET['id']]);
-    $message = 'User deleted';
+    $message = 'User deleted successfully';
     header('Location: users_management.php');
     exit;
 }
@@ -111,9 +128,9 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
     <title>Users Management - Budget System</title>
-    <script src="css/tailwind.css"> </script>
-  <link rel="stylesheet" href="css/all.min.css">
-      <script>
+    <script src="css/tailwind.css"></script>
+    <link rel="stylesheet" href="css/all.min.css">
+    <script>
         tailwind.config = {
             theme: {
                 extend: {
@@ -309,76 +326,96 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             height: 100%;
             cursor: pointer;
         }
+        
+        /* Enhanced table styles */
+        .user-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            background: white;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        
+        .user-table th {
+            background-color: #4f46e5;
+            color: white;
+            padding: 0.75rem 1.5rem;
+            text-align: left;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+        }
+        
+        .user-table td {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        
+        .user-table tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .user-table tr:hover {
+            background-color: #f8fafc;
+        }
+        
+        .role-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .role-admin {
+            background-color: #ede9fe;
+            color: #5b21b6;
+        }
+        
+        .role-officer {
+            background-color: #dbeafe;
+            color: #1e40af;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .action-button {
+            padding: 0.5rem;
+            border-radius: 0.375rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        
+        .edit-button {
+            background-color: #e0e7ff;
+            color: #3730a3;
+        }
+        
+        .edit-button:hover {
+            background-color: #c7d2fe;
+        }
+        
+        .delete-button {
+            background-color: #fee2e2;
+            color: #991b1b;
+        }
+        
+        .delete-button:hover {
+            background-color: #fecaca;
+        }
     </style>
 </head>
 <body class="text-slate-700 flex">
     <!-- Sidebar -->
-    <div class="sidebar" id="sidebar">
-        <div class="p-5">
-            <div class="flex items-center justify-center mb-8">
-                <i class="fas fa-wallet text-amber-300 text-3xl mr-3"></i>
-                <h2 class="text-xl font-bold text-white">Budget System</h2>
-            </div>
-            <ul class="space-y-2">
-                <li>
-                    <a href="dashboard.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                        <i class="fas fa-tachometer-alt w-5"></i>
-                        <span class="ml-3">Dashboard</span>
-                    </a>
-                </li>
-                <?php if ($_SESSION['role'] == 'admin'): ?>
-                    <li>
-                        <a href="budget_adding.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                            <i class="fas fa-plus-circle w-5"></i>
-                            <span class="ml-3">Budget Adding</span>
-                        </a>
-                    </li>
-                    <li>
-                        <a href="settings_owners.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                            <i class="fas fa-building w-5"></i>
-                            <span class="ml-3">Settings Owners</span>
-                        </a>
-                    </li>
-                    <li>
-                        <a href="settings_codes.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                            <i class="fas fa-code w-5"></i>
-                            <span class="ml-3">Settings Codes</span>
-                        </a>
-                    </li>
-                <?php endif; ?>
-                <li>
-                    <a href="transaction.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                        <i class="fas fa-exchange-alt w-5"></i>
-                        <span class="ml-3">Transaction</span>
-                    </a>
-                </li>
-                <li>
-                    <a href="fuel_management.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                        <i class="fas fa-gas-pump w-5"></i>
-                        <span class="ml-3">Fuel Management</span>
-                    </a>
-                </li>
-                <li>
-                    <a href="perdium.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                        <i class="fas fa-dollar-sign w-5"></i>
-                        <span class="ml-3">Perdium Management</span>
-                    </a>
-                </li>
-                <li>
-                    <a href="users_management.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white bg-white/20">
-                        <i class="fas fa-users w-5"></i>
-                        <span class="ml-3">Users Management</span>
-                    </a>
-                </li>
-                <li>
-                    <a href="logout.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
-                        <i class="fas fa-sign-out-alt w-5"></i>
-                        <span class="ml-3">Logout</span>
-                    </a>
-                </li>
-            </ul>
-        </div>
-    </div>
+   
 
     <!-- Main Content -->
     <div class="main-content" id="mainContent">
@@ -427,13 +464,6 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
                         <p class="text-sm text-slate-500">Click the camera icon to upload a profile picture</p>
                     </div>
                     
-                    <div>
-                      <label class="block text-sm font-medium text-slate-700 mb-1">Full Name</label>
-                      <div class="input-group">
-                        <input type="text" name="name" value="<?php echo $user ? $user['name'] : ''; ?>" required>
-                        </div>
-                        </div>
-                    
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div>
                             <label class="block text-sm font-medium text-slate-700 mb-1">Username</label>
@@ -442,7 +472,6 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
                             </div>
                         </div>
                         
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div>
                             <label class="block text-sm font-medium text-slate-700 mb-1">Full Name</label>
                             <div class="input-group">
@@ -456,9 +485,7 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
                                 <input type="password" name="password" placeholder="<?php echo $user ? 'Leave blank to keep current password' : 'Required for new users'; ?>">
                             </div>
                         </div>
-                    </div>
-                    
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        
                         <div>
                             <label class="block text-sm font-medium text-slate-700 mb-1">Role</label>
                             <div class="input-group">
@@ -475,6 +502,11 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
                             <i class="fas <?php echo $user ? 'fa-sync' : 'fa-plus'; ?> mr-2"></i>
                             <?php echo $user ? 'Update User' : 'Add User'; ?>
                         </button>
+                        <?php if ($user): ?>
+                            <a href="users_management.php" class="btn-secondary">
+                                <i class="fas fa-times mr-2"></i> Cancel
+                            </a>
+                        <?php endif; ?>
                         <button type="button" class="btn-info" onclick="window.print()">
                             <i class="fas fa-print mr-2"></i> Print
                         </button>
@@ -486,42 +518,45 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             <div class="bg-white rounded-xl p-6 card-hover">
                 <div class="flex justify-between items-center mb-6">
                     <h2 class="text-xl font-bold text-slate-800">Existing Users</h2>
+                    <span class="bg-blue-100 text-blue-800 text-sm font-medium px-3 py-1 rounded-full">
+                        <?php echo count($users); ?> users
+                    </span>
                 </div>
                 
-                <div class="overflow-x-auto">
-                    <table class="w-full text-sm text-left text-slate-600">
-                        <thead class="text-xs uppercase bg-slate-100 text-slate-700">
+                <div class="overflow-x-auto rounded-lg shadow">
+                    <table class="user-table">
+                        <thead>
                             <tr>
-                                <th class="px-4 py-3">Profile</th>
-                                <th class="px-4 py-3">ID</th>
-                                <th class="px-4 py-3">Username</th>
-                                <th class="px-4 py-3">Full Name</th>
-                                <th class="px-4 py-3">Role</th>
-                                <th class="px-4 py-3 text-center">Actions</th>
+                                <th>Profile</th>
+                                <th>ID</th>
+                                <th>Username</th>
+                                <th>Full Name</th>
+                                <th>Role</th>
+                                <th class="text-center">Actions</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php foreach ($users as $index => $u): ?>
-                                <tr class="border-b border-slate-200 hover:bg-slate-50">
-                                    <td class="px-4 py-2">
+                                <tr>
+                                    <td class="text-center">
                                         <img src="<?php echo !empty($u['profile_picture']) ? $u['profile_picture'] : 'https://via.placeholder.com/40x40?text=U'; ?>" 
-                                             class="profile-picture" alt="Profile Picture">
+                                             class="profile-picture mx-auto" alt="Profile Picture">
                                     </td>
-                                    <td class="px-4 py-2 font-medium"><?php echo $u['id']; ?></td>
-                                    <td class="px-4 py-2"><?php echo htmlspecialchars($u['username']); ?></td>
-                                    <td class="px-4 py-2">
-                                        <span class="px-2 py-1 rounded-full text-xs font-medium 
-                                            <?php echo $u['role'] == 'admin' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'; ?>">
+                                    <td class="font-medium"><?php echo $u['id']; ?></td>
+                                    <td><?php echo htmlspecialchars($u['username']); ?></td>
+                                    <td><?php echo htmlspecialchars($u['name']); ?></td>
+                                    <td>
+                                        <span class="role-badge <?php echo $u['role'] == 'admin' ? 'role-admin' : 'role-officer'; ?>">
                                             <?php echo $u['role']; ?>
                                         </span>
                                     </td>
-                                    <td class="px-4 py-2">
-                                        <div class="flex justify-center space-x-2">
-                                            <a href="?action=edit&id=<?php echo $u['id']; ?>" class="btn-secondary">
-                                                <i class="fas fa-edit mr-1"></i> Edit
+                                    <td>
+                                        <div class="action-buttons justify-center">
+                                            <a href="?action=edit&id=<?php echo $u['id']; ?>" class="action-button edit-button" title="Edit User">
+                                                <i class="fas fa-edit"></i>
                                             </a>
-                                            <a href="?action=delete&id=<?php echo $u['id']; ?>" class="btn-danger" onclick="return confirm('Are you sure you want to delete this user?')">
-                                                <i class="fas fa-trash mr-1"></i> Delete
+                                            <a href="?action=delete&id=<?php echo $u['id']; ?>" class="action-button delete-button" title="Delete User" onclick="return confirm('Are you sure you want to delete this user?')">
+                                                <i class="fas fa-trash"></i>
                                             </a>
                                         </div>
                                     </td>
