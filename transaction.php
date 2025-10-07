@@ -1,6 +1,6 @@
 <?php
 require_once 'includes/init.php';
-include 'includes/sidebar.php';
+//require_once 'includes/sidebar.php';
 $owners = $pdo->query("SELECT * FROM budget_owners")->fetchAll();
 $codes = $pdo->query("SELECT * FROM budget_codes")->fetchAll();
 $transactions = $pdo->query("SELECT t.*, o.code AS owner_code, c.code AS budget_code 
@@ -147,183 +147,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="robots" content="noindex, nofollow">
-    <title>Transaction - Budget System</title>
-   <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="css/all.min.css">
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        primary: '#4f46e5',
-                        secondary: '#7c3aed',
-                        light: '#f8fafc',
-                        lighter: '#f1f5f9',
-                    }
-                }
-            }
-        }
-    </script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        
-        body {
-            font-family: 'Inter', sans-serif;
-            background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
-            min-height: 100vh;
-            color: #334155;
-        }
-        
-        .ethiopic {
-            font-family: 'Noto Sans Ethiopic', sans-serif;
-        }
-        
-        .card-hover {
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-        }
-        
-        .card-hover:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-        }
-        
-        .sidebar {
-            width: 260px;
-            position: fixed;
-            left: 0;
-            top: 0;
-            height: 100vh;
-            z-index: 1000;
-            background: linear-gradient(180deg, #4f46e5 0%, #7c3aed 100%);
-            box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
-            color: white;
-            transition: transform 0.3s ease;
-        }
-        
-        .sidebar.collapsed {
-            transform: translateX(-260px);
-        }
-        
-        @media (max-width: 768px) {
-            .sidebar {
-                transform: translateX(-260px);
-            }
-            
-            .sidebar.active {
-                transform: translateX(0);
-            }
-        }
-        
-        .main-content {
-            transition: margin-left 0.3s ease;
-            margin-left: 260px;
-            width: calc(100% - 260px);
-        }
-        
-        .main-content.expanded {
-            margin-left: 0;
-            width: 100%;
-        }
-        
-        .input-group {
-            transition: all 0.3s ease;
-            border: 1px solid #d1d5db;
-            border-radius: 0.5rem;
-            padding: 0.5rem 0.75rem;
-            display: flex;
-            align-items: center;
-        }
-        
-        .input-group:focus-within {
-            transform: translateY(-2px);
-            border-color: #4f46e5;
-            box-shadow: 0 0 0 1px #4f46e5;
-        }
-        
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            10%, 30%, 50%, 70%, 90% { transform: translateX(-5px); }
-            20%, 40%, 60%, 80% { transform: translateX(5px); }
-        }
-        
-        .shake {
-            animation: shake 0.5s;
-        }
-        
-        input, select, textarea {
-            outline: none;
-            width: 100%;
-            background: transparent;
-        }
-        
-        .btn-primary {
-            background-color: #4f46e5;
-            color: white;
-            padding: 0.75rem 1rem;
-            border-radius: 0.5rem;
-            font-weight: 500;
-            border: none;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-        
-        .btn-primary:hover {
-            background-color: #4338ca;
-        }
-        
-        .btn-secondary {
-            background-color: #6b7280;
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            font-weight: 500;
-            border: none;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-        
-        .btn-secondary:hover {
-            background-color: #4b5563;
-        }
-        
-        .btn-danger {
-            background-color: #ef4444;
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            font-weight: 500;
-            border: none;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-        
-        .btn-danger:hover {
-            background-color: #dc2626;
-        }
-        
-        .btn-info {
-            background-color: #06b6d4;
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            font-weight: 500;
-            border: none;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-        
-        .btn-info:hover {
-            background-color: #0891b2;
-        }
-    </style>
+  <?php
+    // give this page a custom title
+    $pageTitle = 'Per Diem Management';
+    require_once 'includes/head.php';
+  ?>
 </head>
-<body class="text-slate-700 flex">
-    <!-- Sidebar -->
-    
+<body class="text-slate-700 flex bg-gray-100 min-h-screen">
+  <?php require_once 'includes/sidebar.php'; ?>
 
     <!-- Main Content -->
     <div class="main-content" id="mainContent">

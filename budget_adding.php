@@ -1,39 +1,40 @@
 <?php
 require_once 'includes/init.php';
-require_once 'includes/sidebar.php';
-require_admin(); // Admin only
-// session_start();
-// include 'includes/db.php';
 require_once 'includes/functions.php';
-//require_once DIR . '/includes/functions.php';
-if (($_SESSION['role'] ?? '') !== 'admin') {
-    $_SESSION['flash_error'] = 'You are not authorized to access that page.';
-    header('Location: dashboard.php');
-    exit;
-}
+require_admin(); // Admin only
 
+// Secure CSRF
+if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
+function csrf_check($t) { return hash_equals($_SESSION['csrf'] ?? '', $t ?? ''); }
 
-// Make PDO throw exceptions (safer)
-try { 
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION); 
-    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC); 
+// PDO safer defaults
+try {
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 } catch (Throwable $e) {}
 
-$BUDGET_TYPE_PROGRAM = 'program'; // change to 'programs' if your enum uses that
+$BUDGET_TYPE_PROGRAM = 'program'; // matches your enum
 
-// Fallback EC months + quarter mapping
-if (!isset($etMonths) || !is_array($etMonths)) {
-    $etMonths = ['Meskerem','Tikimt','Hidar','Tahsas','Tir','Yekatit','Megabit','Miazia','Ginbot','Sene','Hamle','Nehase'];
-}
+// EC months (English transliterations used for storage/display here)
+$EC_MONTHS_EN = ['Meskerem','Tikimt','Hidar','Tahsas','Tir','Yekatit','Megabit','Miazia','Ginbot','Sene','Hamle','Nehase','Pagume'];
 $quarterMap = [
     'Meskerem'=>1,'Tikimt'=>1,'Hidar'=>1,
     'Tahsas'=>2,'Tir'=>2,'Yekatit'=>2,
     'Megabit'=>3,'Miazia'=>3,'Ginbot'=>3,
-    'Sene'=>4,'Hamle'=>4,'Nehase'=>4,
-    'Pagume'=>4
+    'Sene'=>4,'Hamle'=>4,'Nehase'=>4,'Pagume'=>4
 ];
 
-// JSON endpoint: Availability
+// Month normalizer -> ec_month number (accept Amharic or English)
+function ecMonthNoFromString(string $m): ?int {
+    static $map = [
+        'Meskerem'=>1,'Tikimt'=>2,'Hidar'=>3,'Tahsas'=>4,'Tir'=>5,'Yekatit'=>6,'Megabit'=>7,'Miazia'=>8,'Ginbot'=>9,'Sene'=>10,'Hamle'=>11,'Nehase'=>12,'Pagume'=>13,
+        'መስከረም'=>1,'ጥቅምት'=>2,'ህዳር'=>3,'ታኅሳስ'=>4,'ጥር'=>5,'የካቲት'=>6,'መጋቢት'=>7,'ሚያዝያ'=>8,'ግንቦት'=>9,'ሰኔ'=>10,'ሐምሌ'=>11,'ነሐሴ'=>12,'ጳጉሜ'=>13
+    ];
+    $m = trim($m);
+    return $map[$m] ?? null;
+}
+
+// JSON endpoint: Availability (yearly + monthly remaining)
 if (isset($_GET['action']) && $_GET['action'] === 'availability') {
     header('Content-Type: application/json');
     try {
@@ -46,16 +47,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'availability') {
 
         if (!$owner_id) throw new Exception('owner_id required');
 
-        // Derive EC year
+        // Derive EC year (fallback: Gregorian-8)
         $etInfo = function_exists('getEtMonthAndQuarter') ? getEtMonthAndQuarter($adding_date) : null;
         $year   = $etInfo['year'] ?? (date('Y', strtotime($adding_date)) - 8);
 
         $resp = ['ok'=>true, 'yearlyAvailable'=>0, 'monthlyAvailable'=>0];
 
         if ($budget_type === $BUDGET_TYPE_PROGRAM) {
-            // Program: yearly-only; code_id may be NULL
-            $sql = "SELECT COALESCE(SUM(remaining_yearly),0) AS y
-                    FROM budgets
+            // Programs: yearly-only
+            $sql = "SELECT COALESCE(SUM(remaining_yearly),0) FROM budgets
                     WHERE owner_id=? AND year=? AND budget_type=? AND monthly_amount=0";
             $p   = [$owner_id, $year, $BUDGET_TYPE_PROGRAM];
             if ($code_id === null) {
@@ -68,7 +68,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'availability') {
             $st->execute($p);
             $resp['yearlyAvailable'] = (float)$st->fetchColumn();
         } else {
-            // Government: yearly + monthly
+            // Governmental
             // Yearly remaining from yearly row (monthly_amount=0)
             $stY = $pdo->prepare("SELECT remaining_yearly
                                   FROM budgets
@@ -77,12 +77,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'availability') {
             $stY->execute([$owner_id, (int)$code_id, $year]);
             $resp['yearlyAvailable'] = (float)($stY->fetchColumn() ?: 0);
 
-            // Monthly remaining = sum of remaining_monthly for this month
+            // Monthly remaining by ec_month (canonical)
+            $ecm = ecMonthNoFromString($month);
             $stM = $pdo->prepare("SELECT COALESCE(SUM(remaining_monthly),0)
                                   FROM budgets
                                   WHERE owner_id=? AND code_id=? AND year=? AND budget_type='governmental'
-                                        AND monthly_amount>0 AND month=?");
-            $stM->execute([$owner_id, (int)$code_id, $year, $month]);
+                                        AND monthly_amount>0 AND ec_month=?");
+            $stM->execute([$owner_id, (int)$code_id, $year, $ecm]);
             $resp['monthlyAvailable'] = (float)$stM->fetchColumn();
         }
 
@@ -94,7 +95,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'availability') {
     exit;
 }
 
-// JSON endpoint: Budgets listing (filter without page reload)
+// JSON endpoint: Budgets listing
 if (isset($_GET['action']) && $_GET['action'] === 'budgets') {
     header('Content-Type: application/json');
     try {
@@ -105,12 +106,14 @@ if (isset($_GET['action']) && $_GET['action'] === 'budgets') {
         $code_id     = $has_code ? (int)$code_id_raw : null;
 
         $q = "SELECT b.id, b.budget_type, b.program_name,
-                     o.code AS owner_code, o.name AS owner_name,
+                     COALESCE(go.code, po.code) AS owner_code,
+                     COALESCE(go.name, po.name) AS owner_name,
                      c.code AS budget_code, c.name AS budget_name,
-                     b.month, b.monthly_amount, b.yearly_amount
+                     b.month, b.ec_month, b.monthly_amount, b.yearly_amount
               FROM budgets b
-              LEFT JOIN budget_owners o ON b.owner_id = o.id
-              LEFT JOIN budget_codes  c ON b.code_id  = c.id
+              LEFT JOIN budget_owners     go ON (b.owner_id = go.id AND b.budget_type='governmental')
+              LEFT JOIN p_budget_owners   po ON (b.owner_id = po.id AND b.budget_type='program')
+              LEFT JOIN budget_codes       c ON b.code_id  = c.id
               WHERE b.budget_type = ?";
         $p = [$budget_type];
 
@@ -130,11 +133,12 @@ if (isset($_GET['action']) && $_GET['action'] === 'budgets') {
     exit;
 }
 
-// Load owners and codes
-$owners = $pdo->query("SELECT id, code, name FROM budget_owners ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
+// Load owners and codes for initial render
+$gov_owners = $pdo->query("SELECT id, code, name FROM budget_owners ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
+$prog_owners = $pdo->query("SELECT id, code, name FROM p_budget_owners ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
 $codes  = $pdo->query("SELECT id, code, name FROM budget_codes ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
 
-// State for server-rendered form
+// State
 $selected_owner_id  = $_POST['owner_id'] ?? ($_GET['owner_id'] ?? null);
 $selected_code_id   = $_POST['code_id']  ?? ($_GET['code_id']  ?? null);
 $selected_type      = $_POST['budget_type'] ?? ($_GET['budget_type'] ?? 'governmental'); // governmental | program
@@ -143,19 +147,57 @@ $selected_type      = $_POST['budget_type'] ?? ($_GET['budget_type'] ?? 'governm
 $budget = null;
 if (isset($_GET['action']) && $_GET['action'] == 'edit' && isset($_GET['id'])) {
     $stmt = $pdo->prepare("SELECT * FROM budgets WHERE id = ?");
-    $stmt->execute([$_GET['id']]);
+    $stmt->execute([(int)$_GET['id']]);
     $budget = $stmt->fetch(PDO::FETCH_ASSOC);
     if ($budget) $selected_type = $budget['budget_type'];
 }
 
-// Save (POST)
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && (!isset($_GET['action']) || $_GET['action']!=='availability')) {
+// Handle POST (Create/Update/Delete)
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // CSRF
+    if (!csrf_check($_POST['csrf'] ?? '')) {
+        $_SESSION['flash_error'] = 'Bad CSRF token.';
+        header('Location: budget_adding.php'); exit;
+    }
+
+    // DELETE (via POST form)
+    if (isset($_POST['action']) && $_POST['action'] === 'delete') {
+        $del_id = (int)($_POST['id'] ?? 0);
+        if ($del_id <= 0) { $_SESSION['flash_error'] = 'Invalid delete request.'; header('Location: budget_adding.php'); exit; }
+
+        $stmt = $pdo->prepare("SELECT owner_id, code_id, year, monthly_amount, remaining_yearly, budget_type, month, ec_month FROM budgets WHERE id = ?");
+        $stmt->execute([$del_id]);
+        $b = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        $pdo->beginTransaction();
+        try {
+            if ($b && $b['budget_type'] === 'governmental' && (float)$b['monthly_amount'] > 0) {
+                // Restore the yearly remaining
+                $stmt = $pdo->prepare("UPDATE budgets
+                                       SET remaining_yearly = remaining_yearly + ?
+                                       WHERE owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0 AND budget_type='governmental'");
+                $stmt->execute([$b['monthly_amount'], $b['owner_id'], $b['code_id'], $b['year']]);
+            }
+            $stmt = $pdo->prepare("DELETE FROM budgets WHERE id = ?");
+            $stmt->execute([$del_id]);
+
+            $pdo->commit();
+            $_SESSION['flash_success'] = 'Budget deleted';
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $_SESSION['flash_error'] = 'Error deleting budget: ' . $e->getMessage();
+        }
+        header('Location: budget_adding.php?owner_id='.(int)$b['owner_id'].'&budget_type='.urlencode($b['budget_type']).($b['code_id']?'&code_id='.(int)$b['code_id']:'')); exit;
+    }
+
+    // CREATE/UPDATE
     $owner_id      = (int)($_POST['owner_id'] ?? 0);
     $code_id       = isset($_POST['code_id']) && $_POST['code_id'] !== '' ? (int)$_POST['code_id'] : null;
     $adding_date   = $_POST['adding_date'] ?? date('Y-m-d');
     $budget_type   = ($_POST['budget_type'] ?? 'governmental') === $BUDGET_TYPE_PROGRAM ? $BUDGET_TYPE_PROGRAM : 'governmental';
     $program_name  = trim($_POST['program_name'] ?? '');
     $month         = $_POST['month'] ?? '';
+    $ec_month      = ecMonthNoFromString($month);
     $yearly_amount = (float)($_POST['yearly_amount'] ?? 0);
     $monthly_amount= (float)($_POST['monthly_amount'] ?? 0);
 
@@ -165,169 +207,143 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && (!isset($_GET['action']) || $_GET['a
     $quarter= $budget_type === 'governmental' ? ($quarterMap[$month] ?? 0) : 0;
 
     if (!$owner_id) {
-        $message = 'Please select Budget Owner.';
-    } else {
-        $pdo->beginTransaction();
-        try {
-            // Update path
-            if (isset($_POST['id']) && ($_POST['action'] ?? '') === 'update') {
-                $id = (int)$_POST['id'];
-                if ($budget_type === $BUDGET_TYPE_PROGRAM) {
-                    // Programs: yearly-only
-                    $stmt = $pdo->prepare("UPDATE budgets
-                        SET owner_id=?, code_id=?, adding_date=?, year=?, yearly_amount=?, month=?, monthly_amount=?, quarter=?,
-                            remaining_yearly=?, remaining_monthly=?, remaining_quarterly=?, budget_type=?, program_name=?, is_yearly=?
-                        WHERE id=?");
-                    $stmt->execute([
-                        $owner_id, $code_id, $adding_date, $year, $yearly_amount,
-                        '', 0, 0,
-                        $yearly_amount, 0, 0,
-                        $budget_type, ($program_name ?: null), 1,
-                        $id
-                    ]);
-                    $message = 'Program yearly budget updated';
-                } else {
-                    // Governmental
-                    $stmt = $pdo->prepare("UPDATE budgets
-                        SET owner_id=?, code_id=?, adding_date=?, year=?, yearly_amount=?, month=?, monthly_amount=?, quarter=?, budget_type=?, program_name=?
-                        WHERE id=?");
-                    $stmt->execute([
-                        $owner_id, $code_id, $adding_date, $year, $yearly_amount, $month, $monthly_amount, $quarter,
-                        'governmental', null, $id
-                    ]);
-                    $message = 'Government budget updated';
-                }
-                $pdo->commit();
-            }
-            // Create path
-            else {
-                if ($budget_type === $BUDGET_TYPE_PROGRAM) {
-                    // Programs: Yearly only
-                    if ($monthly_amount > 0) throw new Exception('Programs budget does not allow Monthly Amount.');
-                    if ($yearly_amount <= 0) throw new Exception('Enter a valid Yearly Amount for programs budget.');
-
-                    // One yearly programs row per (owner,[code],year)
-                    $sql = "SELECT id FROM budgets
-                            WHERE owner_id=? AND year=? AND budget_type=? AND monthly_amount=0";
-                    $p   = [$owner_id, $year, $BUDGET_TYPE_PROGRAM];
-                    if ($code_id !== null) { $sql .= " AND code_id = ?"; $p[] = $code_id; }
-                    else { $sql .= " AND code_id IS NULL"; }
-                    $chk = $pdo->prepare($sql); $chk->execute($p);
-                    if ($chk->fetch()) throw new Exception('Program yearly budget already exists for this Owner/Code/Year.');
-
-                    $stmt = $pdo->prepare("INSERT INTO budgets
-                        (owner_id, code_id, adding_date, year, yearly_amount, month, monthly_amount, quarter,
-                         remaining_yearly, remaining_monthly, remaining_quarterly, is_yearly, budget_type, program_name)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-                    $stmt->execute([
-                        $owner_id, $code_id, $adding_date, $year, $yearly_amount,
-                        '', 0, 0,
-                        $yearly_amount, 0, 0,
-                        1, $BUDGET_TYPE_PROGRAM, ($program_name ?: null)
-                    ]);
-                    $pdo->commit();
-                    $message = 'Program yearly budget added successfully.';
-                } else {
-                    // Governmental — Yearly + Monthly in same submit if provided
-
-                    if (!$code_id) throw new Exception('Select Budget Code for Government budgets.');
-                    if ($monthly_amount > 0 && empty($month)) throw new Exception('Select Month for Monthly Amount.');
-
-                    // Lock yearly row (gov)
-                    $sqlY = "SELECT id, yearly_amount, remaining_yearly FROM budgets
-                             WHERE owner_id=? AND code_id=? AND year=? AND monthly_amount=0 AND budget_type='governmental'
-                             FOR UPDATE";
-                    $stY  = $pdo->prepare($sqlY);
-                    $stY->execute([$owner_id, $code_id, $year]);
-                    $yearly_budget = $stY->fetch(PDO::FETCH_ASSOC);
-
-                    $didYearly = false;
-                    $didMonthly = false;
-
-                    if ($yearly_amount > 0) {
-                        if ($yearly_budget) throw new Exception('Yearly budget already exists for this Owner + Code + Year (government).');
-                        $insY = $pdo->prepare("INSERT INTO budgets
-                            (owner_id, code_id, adding_date, year, yearly_amount, month, monthly_amount, quarter,
-                             remaining_yearly, remaining_monthly, remaining_quarterly, is_yearly, budget_type)
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
-                        $insY->execute([
-                            $owner_id, $code_id, $adding_date, $year, $yearly_amount,
-                            '', 0, 0,
-                            $yearly_amount, 0, 0,
-                            1, 'governmental'
-                        ]);
-                        $yearly_budget = [
-                            'id' => $pdo->lastInsertId(),
-                            'yearly_amount' => $yearly_amount,
-                            'remaining_yearly' => $yearly_amount
-                        ];
-                        $didYearly = true;
-                    }
-
-                    if ($monthly_amount > 0) {
-                        if (!$yearly_budget) throw new Exception('No yearly budget exists. Add yearly budget first (or provide both Yearly and Monthly now).');
-                        if ($monthly_amount > (float)$yearly_budget['remaining_yearly']) throw new Exception('Monthly amount exceeds remaining yearly budget.');
-
-                        $quarter = $quarterMap[$month] ?? 0;
-                        $new_remaining_yearly = (float)$yearly_budget['remaining_yearly'] - $monthly_amount;
-
-                        $insM = $pdo->prepare("INSERT INTO budgets
-                            (owner_id, code_id, adding_date, year, yearly_amount, month, monthly_amount, quarter,
-                             remaining_yearly, remaining_monthly, remaining_quarterly, is_yearly, budget_type)
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
-                        $insM->execute([
-                            $owner_id, $code_id, $adding_date, $year, 0,
-                            $month, $monthly_amount, $quarter,
-                            $new_remaining_yearly, $monthly_amount, $monthly_amount * 3,
-                            0, 'governmental'
-                        ]);
-                        $upd = $pdo->prepare("UPDATE budgets SET remaining_yearly=? WHERE id=?");
-                        $upd->execute([$new_remaining_yearly, $yearly_budget['id']]);
-                        $didMonthly = true;
-                    }
-
-                    if (!$didYearly && !$didMonthly) throw new Exception('Please enter a Yearly or Monthly amount.');
-
-                    if ($didYearly && $didMonthly) $message = 'Yearly + Monthly governmental budgets added successfully.';
-                    elseif ($didYearly) $message = 'Yearly governmental budget added successfully.';
-                    else $message = 'Monthly governmental budget added successfully.';
-
-                    $pdo->commit();
-                }
-            }
-        } catch (Exception $e) {
-            $pdo->rollBack();
-            $message = 'Error: ' . $e->getMessage();
-        }
+        $_SESSION['flash_error'] = 'Please select Budget Owner.';
+        header('Location: budget_adding.php'); exit;
     }
-}
-
-// Delete (same as before, page will redirect after delete)
-if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id'])) {
-    $stmt = $pdo->prepare("SELECT owner_id, code_id, year, monthly_amount, remaining_yearly, budget_type FROM budgets WHERE id = ?");
-    $stmt->execute([$_GET['id']]);
-    $budget = $stmt->fetch(PDO::FETCH_ASSOC);
 
     $pdo->beginTransaction();
     try {
-        if ($budget && $budget['budget_type'] === 'governmental' && (float)$budget['monthly_amount'] > 0) {
-            $stmt = $pdo->prepare("UPDATE budgets
-                                   SET remaining_yearly = remaining_yearly + ?
-                                   WHERE owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0 AND budget_type='governmental'");
-            $stmt->execute([$budget['monthly_amount'], $budget['owner_id'], $budget['code_id'], $budget['year']]);
+        if (isset($_POST['id']) && ($_POST['action'] ?? '') === 'update') {
+            $id = (int)$_POST['id'];
+            if ($budget_type === $BUDGET_TYPE_PROGRAM) {
+                // Programs: yearly-only
+                $stmt = $pdo->prepare("UPDATE budgets
+                    SET owner_id=?, code_id=?, adding_date=?, year=?, yearly_amount=?, month=?, ec_month=?, monthly_amount=?, quarter=?,
+                        remaining_yearly=?, remaining_monthly=?, remaining_quarterly=?, budget_type=?, program_name=?, is_yearly=?
+                    WHERE id=?");
+                $stmt->execute([
+                    $owner_id, $code_id, $adding_date, $year, $yearly_amount,
+                    '', null, 0, 0,
+                    $yearly_amount, 0, 0,
+                    $budget_type, ($program_name ?: null), 1,
+                    $id
+                ]);
+                $_SESSION['flash_success'] = 'Program yearly budget updated';
+            } else {
+                // Governmental (update a single row as-is)
+                $stmt = $pdo->prepare("UPDATE budgets
+                    SET owner_id=?, code_id=?, adding_date=?, year=?, yearly_amount=?, month=?, ec_month=?, monthly_amount=?, quarter=?, budget_type=?, program_name=?
+                    WHERE id=?");
+                $stmt->execute([
+                    $owner_id, $code_id, $adding_date, $year, $yearly_amount,
+                    $month, $ec_month, $monthly_amount, $quarter,
+                    'governmental', null, $id
+                ]);
+                $_SESSION['flash_success'] = 'Government budget updated';
+            }
+            $pdo->commit();
+            header('Location: budget_adding.php?owner_id='.$owner_id.'&budget_type='.$budget_type.($code_id?'&code_id='.$code_id:'')); exit;
         }
-        $stmt = $pdo->prepare("DELETE FROM budgets WHERE id = ?");
-        $stmt->execute([$_GET['id']]);
+
+        // CREATE
+        if ($budget_type === $BUDGET_TYPE_PROGRAM) {
+            // Programs: Yearly only
+            if ($monthly_amount > 0) throw new Exception('Programs budget does not allow Monthly Amount.');
+            if ($yearly_amount <= 0) throw new Exception('Enter a valid Yearly Amount for programs budget.');
+
+            // Prevent duplicates (owner,[code],year)
+            $sql = "SELECT id FROM budgets
+                    WHERE owner_id=? AND year=? AND budget_type=? AND monthly_amount=0";
+            $p   = [$owner_id, $year, $BUDGET_TYPE_PROGRAM];
+            if ($code_id !== null) { $sql .= " AND code_id = ?"; $p[] = $code_id; }
+            else { $sql .= " AND code_id IS NULL"; }
+            $chk = $pdo->prepare($sql);
+            $chk->execute($p);
+            if ($chk->fetch()) throw new Exception('Program yearly budget already exists for this Owner/Code/Year.');
+
+            $stmt = $pdo->prepare("INSERT INTO budgets
+                (owner_id, code_id, adding_date, year, yearly_amount, month, ec_month, monthly_amount, quarter,
+                 remaining_yearly, remaining_monthly, remaining_quarterly, is_yearly, budget_type, program_name)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            $stmt->execute([
+                $owner_id, $code_id, $adding_date, $year, $yearly_amount,
+                '', null, 0, 0,
+                $yearly_amount, 0, 0,
+                1, $BUDGET_TYPE_PROGRAM, ($program_name ?: null)
+            ]);
+            $_SESSION['flash_success'] = 'Program yearly budget added successfully.';
+        } else {
+            // Governmental — Yearly + Monthly in same submit if provided
+            if (!$code_id) throw new Exception('Select Budget Code for Government budgets.');
+            if ($monthly_amount > 0 && empty($month)) throw new Exception('Select Month for Monthly Amount.');
+
+            // Lock yearly row
+            $sqlY = "SELECT id, yearly_amount, remaining_yearly
+                     FROM budgets
+                     WHERE owner_id=? AND code_id=? AND year=? AND monthly_amount=0 AND budget_type='governmental'
+                     FOR UPDATE";
+            $stY  = $pdo->prepare($sqlY);
+            $stY->execute([$owner_id, $code_id, $year]);
+            $yearly_budget = $stY->fetch(PDO::FETCH_ASSOC);
+
+            $didYearly = false;
+            $didMonthly = false;
+
+            if ($yearly_amount > 0) {
+                if ($yearly_budget) throw new Exception('Yearly budget already exists for this Owner + Code + Year (government).');
+                $insY = $pdo->prepare("INSERT INTO budgets
+                    (owner_id, code_id, adding_date, year, yearly_amount, month, ec_month, monthly_amount, quarter,
+                     remaining_yearly, remaining_monthly, remaining_quarterly, is_yearly, budget_type)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                $insY->execute([
+                    $owner_id, $code_id, $adding_date, $year, $yearly_amount,
+                    '', null, 0, 0,
+                    $yearly_amount, 0, 0,
+                    1, 'governmental'
+                ]);
+                $yearly_budget = [
+                    'id' => $pdo->lastInsertId(),
+                    'yearly_amount' => $yearly_amount,
+                    'remaining_yearly' => $yearly_amount
+                ];
+                $didYearly = true;
+            }
+
+            if ($monthly_amount > 0) {
+                if (!$yearly_budget) throw new Exception('No yearly budget exists. Add yearly budget first (or provide both Yearly and Monthly now).');
+                if ($monthly_amount > (float)$yearly_budget['remaining_yearly']) throw new Exception('Monthly amount exceeds remaining yearly budget.');
+                if (!$ec_month) throw new Exception('Invalid EC month.');
+
+                $quarter = $quarterMap[$month] ?? 0;
+                $new_remaining_yearly = (float)$yearly_budget['remaining_yearly'] - $monthly_amount;
+
+                $insM = $pdo->prepare("INSERT INTO budgets
+                    (owner_id, code_id, adding_date, year, yearly_amount, month, ec_month, monthly_amount, quarter,
+                     remaining_yearly, remaining_monthly, remaining_quarterly, is_yearly, budget_type)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                $insM->execute([
+                    $owner_id, $code_id, $adding_date, $year, 0,
+                    $month, $ec_month, $monthly_amount, $quarter,
+                    $new_remaining_yearly, $monthly_amount, $monthly_amount * 3,
+                    0, 'governmental'
+                ]);
+                $upd = $pdo->prepare("UPDATE budgets SET remaining_yearly=? WHERE id=?");
+                $upd->execute([$new_remaining_yearly, $yearly_budget['id']]);
+                $didMonthly = true;
+            }
+
+            if (!$didYearly && !$didMonthly) throw new Exception('Please enter a Yearly or Monthly amount.');
+            $_SESSION['flash_success'] =
+                ($didYearly && $didMonthly) ? 'Yearly + Monthly governmental budgets added successfully.' :
+                ($didYearly ? 'Yearly governmental budget added successfully.' : 'Monthly governmental budget added successfully.');
+        }
 
         $pdo->commit();
-        $message = 'Budget deleted';
-        $redir = 'budget_adding.php?owner_id=' . $budget['owner_id'] . '&budget_type=' . urlencode($budget['budget_type']);
-        if (!empty($budget['code_id'])) $redir .= '&code_id=' . $budget['code_id'];
-        header('Location: ' . $redir);
-        exit;
+        header('Location: budget_adding.php?owner_id='.$owner_id.'&budget_type='.$budget_type.($code_id?'&code_id='.$code_id:'')); exit;
     } catch (Exception $e) {
         $pdo->rollBack();
-        $message = 'Error deleting budget: ' . $e->getMessage();
+        $_SESSION['flash_error'] = 'Error: ' . $e->getMessage();
+        header('Location: budget_adding.php'); exit;
     }
 }
 ?>
@@ -337,6 +353,13 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Budget Adding - Budget System</title>
+
+  <link rel="icon" type="image/png" href="images/bureau-logo.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="images/bureau-logo.png">
+  <meta name="theme-color" content="#4f46e5">
+  <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -353,6 +376,7 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
   </script>
   <link rel="stylesheet" href="css/all.min.css">
   <link rel="stylesheet" href="css/sidebar.css">
+  <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
     body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#f1f5f9 0%,#e2e8f0 100%);min-height:100vh;color:#334155;}
@@ -366,15 +390,16 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
     .btn-secondary{background:#6b7280;color:#fff}.btn-secondary:hover{background:#4b5563}
     .btn-danger{background:#ef4444;color:#fff}.btn-danger:hover{background:#dc2626}
     .btn-info{background:#06b6d4;color:#fff}.btn-info:hover{background:#0891b2}
+    .select2-container--default .select2-selection--single{height:42px;border:1px solid #d1d5db;border-radius:.5rem}
+    .select2-container--default .select2-selection--single .select2-selection__rendered{line-height:40px;padding-left:12px}
+    .select2-container--default .select2-selection--single .select2-selection__arrow{height:40px}
   </style>
 </head>
 <body class="text-slate-700 flex">
-  <!-- Sidebar -->
- 
-  <!-- Main Content -->
+  <?php require_once 'includes/sidebar.php'; ?>
+
   <div class="main-content" id="mainContent">
     <div class="p-6">
-      <!-- Header -->
       <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 p-6 bg-white rounded-xl shadow-sm">
         <div>
           <h1 class="text-2xl md:text-3xl font-bold text-slate-800">Budget Management</h1>
@@ -387,26 +412,33 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
         </div>
       </div>
 
-      <!-- Budget Form -->
+      <?php if (!empty($_SESSION['flash_error'])): ?>
+        <div class="bg-red-50 text-red-700 p-4 rounded-lg mb-6">
+          <i class="fas fa-circle-exclamation mr-2"></i><?php echo htmlspecialchars($_SESSION['flash_error']); ?>
+        </div>
+        <?php unset($_SESSION['flash_error']); ?>
+      <?php endif; ?>
+      <?php if (!empty($_SESSION['flash_success'])): ?>
+        <div class="bg-green-50 text-green-700 p-4 rounded-lg mb-6">
+          <i class="fas fa-circle-check mr-2"></i><?php echo htmlspecialchars($_SESSION['flash_success']); ?>
+        </div>
+        <?php unset($_SESSION['flash_success']); ?>
+      <?php endif; ?>
+
       <div class="bg-white rounded-xl p-6 card-hover mb-8">
         <h2 class="text-xl font-bold text-slate-800 mb-6">Budget Adding Form</h2>
-        <?php if (isset($message)): ?>
-          <div class="bg-blue-50 text-blue-700 p-4 rounded-lg mb-6">
-            <i class="fas fa-info-circle mr-2"></i><?php echo htmlspecialchars($message); ?>
-          </div>
-        <?php endif; ?>
 
         <form method="post" class="space-y-6" id="budgetForm">
+          <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['csrf']); ?>">
           <?php if ($budget): ?>
             <input type="hidden" name="id" value="<?php echo (int)$budget['id']; ?>">
             <input type="hidden" name="action" value="update">
           <?php endif; ?>
 
-          <!-- Budget Type + Program Name -->
           <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Budget Source Type</label>
-              <select name="budget_type" id="budget_type" class="input-group" onchange="toggleBudgetType(); refreshAvailability(); fetchBudgets();" required>
+              <select name="budget_type" id="budget_type" class="w-full select2" onchange="toggleBudgetType(); fetchAndPopulateOwners(); refreshAvailability(); fetchBudgets();" required>
                 <option value="governmental" <?php echo ($selected_type==='governmental' ? 'selected':''); ?>>Government Budget</option>
                 <option value="<?php echo $BUDGET_TYPE_PROGRAM; ?>" <?php echo ($selected_type===$BUDGET_TYPE_PROGRAM ? 'selected':''); ?>>Programs Budget</option>
               </select>
@@ -419,7 +451,6 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             </div>
           </div>
 
-          <!-- Owner + Date -->
           <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Budget Adding Date</label>
@@ -429,20 +460,36 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
 
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Budget Owners Code</label>
-              <select name="owner_id" class="input-group" required onchange="updateSelectedOwner(this); refreshAvailability(); fetchBudgets();">
+              <select name="owner_id" id="owner_id" class="w-full select2" required onchange="updateSelectedOwner(this); refreshAvailability(); fetchBudgets();">
                 <option value="">-- Select Owner --</option>
-                <?php foreach ($owners as $o): ?>
-                  <option value="<?php echo (int)$o['id']; ?>" <?php
-                    $sel = $budget ? ((int)$budget['owner_id']===(int)$o['id']) : ((int)$selected_owner_id===(int)$o['id']);
-                    echo $sel ? 'selected' : ''; ?>>
-                    <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
-                  </option>
-                <?php endforeach; ?>
+                <?php
+                if ($selected_type === $BUDGET_TYPE_PROGRAM) {
+                    foreach ($prog_owners as $o): ?>
+                      <option value="<?php echo (int)$o['id']; ?>" <?php
+                        $sel = $budget ? ((int)$budget['owner_id']===(int)$o['id']) : ((int)$selected_owner_id===(int)$o['id']);
+                        echo $sel ? 'selected' : ''; ?>>
+                        <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
+                      </option>
+                    <?php endforeach;
+                } else {
+                    foreach ($gov_owners as $o): ?>
+                      <option value="<?php echo (int)$o['id']; ?>" <?php
+                        $sel = $budget ? ((int)$budget['owner_id']===(int)$o['id']) : ((int)$selected_owner_id===(int)$o['id']);
+                        echo $sel ? 'selected' : ''; ?>>
+                        <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
+                      </option>
+                    <?php endforeach;
+                }
+                ?>
               </select>
               <small class="text-slate-500 text-sm mt-1 block">Selected Owner: <span id="selected_owner">
                 <?php
                   if ($budget) {
-                    $found = array_filter($owners, fn($x)=> (int)$x['id']===(int)$budget['owner_id']);
+                    if ($budget['budget_type'] === $BUDGET_TYPE_PROGRAM) {
+                      $found = array_filter($prog_owners, fn($x)=> (int)$x['id']===(int)$budget['owner_id']);
+                    } else {
+                      $found = array_filter($gov_owners, fn($x)=> (int)$x['id']===(int)$budget['owner_id']);
+                    }
                     echo $found ? htmlspecialchars(array_values($found)[0]['name']) : '';
                   }
                 ?>
@@ -450,11 +497,10 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             </div>
           </div>
 
-          <!-- Code + Month -->
           <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div>
+            <div id="code_box">
               <label class="block text-sm font-medium text-slate-700 mb-1">Budget Code</label>
-              <select name="code_id" id="code_id" class="input-group" onchange="updateSelectedCode(this); refreshAvailability(); fetchBudgets();">
+              <select name="code_id" id="code_id" class="w-full select2" onchange="updateSelectedCode(this); refreshAvailability(); fetchBudgets();">
                 <option value="">-- No code (General) --</option>
                 <?php foreach ($codes as $c): ?>
                   <option value="<?php echo (int)$c['id']; ?>" <?php
@@ -476,9 +522,9 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             </div>
 
             <div id="month_box">
-              <label class="block text-sm font-medium text-slate-700 mb-1">Select Month Info (EC)</label>
-              <select id="month" name="month" class="input-group" onchange="updateQuarter(); refreshAvailability();">
-                <?php foreach ($etMonths as $m): ?>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Select Month (EC)</label>
+              <select id="month" name="month" class="w-full select2" onchange="updateQuarter(); refreshAvailability();">
+                <?php foreach ($EC_MONTHS_EN as $m): ?>
                   <option value="<?php echo htmlspecialchars($m); ?>" <?php
                     $sel = $budget ? ($budget['month']===$m) : false;
                     echo $sel ? 'selected' : ''; ?>>
@@ -489,7 +535,6 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             </div>
           </div>
 
-          <!-- Amounts -->
           <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div id="monthly_amount_box">
               <label class="block text-sm font-medium text-slate-700 mb-1">Monthly Amount</label>
@@ -504,13 +549,10 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             </div>
           </div>
 
-          <!-- Availability cards -->
           <div class="grid grid-cols-1 md:grid-cols-2 gap-6" id="availability_panel">
             <div id="avail_monthly_card" class="rounded-xl p-5 bg-gradient-to-r from-amber-100 to-amber-50 border border-amber-200 shadow-sm">
               <div class="flex items-center gap-3">
-                <div class="p-3 rounded-full bg-amber-200 text-amber-800">
-                  <i class="fas fa-calendar-alt"></i>
-                </div>
+                <div class="p-3 rounded-full bg-amber-200 text-amber-800"><i class="fas fa-calendar-alt"></i></div>
                 <div>
                   <div class="text-sm text-amber-800 font-medium">Available Monthly Budget</div>
                   <div id="avail_monthly" class="text-2xl font-bold text-amber-900 mt-1">—</div>
@@ -519,9 +561,7 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
             </div>
             <div class="rounded-xl p-5 bg-gradient-to-r from-emerald-100 to-emerald-50 border border-emerald-200 shadow-sm">
               <div class="flex items-center gap-3">
-                <div class="p-3 rounded-full bg-emerald-200 text-emerald-800">
-                  <i class="fas fa-coins"></i>
-                </div>
+                <div class="p-3 rounded-full bg-emerald-200 text-emerald-800"><i class="fas fa-coins"></i></div>
                 <div>
                   <div class="text-sm text-emerald-800 font-medium">Available Yearly Budget</div>
                   <div id="avail_yearly" class="text-2xl font-bold text-emerald-900 mt-1">—</div>
@@ -529,7 +569,7 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
               </div>
             </div>
           </div>
-          <!-- Quarter -->
+
           <div class="flex gap-3 mt-6">
             <button type="submit" class="btn btn-primary"><?php echo $budget ? 'Update' : 'Save'; ?></button>
             <button type="button" class="btn btn-info" onclick="window.print()"><i class="fas fa-print mr-2"></i> Print</button>
@@ -537,7 +577,6 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
         </form>
       </div>
 
-      <!-- Existing Budgets (AJAX) -->
       <div class="bg-white rounded-xl p-6 card-hover">
         <div class="flex items-center justify-between mb-6">
           <div>
@@ -572,9 +611,49 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
     </div>
   </div>
 
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
   <script>
     function formatMoney(n){ return (Number(n)||0).toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2}); }
     function escapeHtml(s){ return (s??'').toString().replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+    function fetchAndPopulateOwners() {
+        const budgetType = $('#budget_type').val();
+        const ownerSelect = $('#owner_id');
+
+        const budgetOwnerId   = '<?php echo $budget['owner_id']   ?? ''; ?>';
+        const budgetBudgetType= '<?php echo $budget['budget_type']?? ''; ?>';
+
+        ownerSelect.prop('disabled', true).html('<option value="">Loading...</option>').trigger('change.select2');
+
+        $.ajax({
+            url: 'ajax_get_owners.php',
+            type: 'GET',
+            data: { budget_type: budgetType },
+            dataType: 'json',
+            success: function(response) {
+                if (response.success && Array.isArray(response.owners)) {
+                    ownerSelect.html('<option value="">Select Owner</option>');
+                    response.owners.forEach(function(owner) {
+                        const option = new Option(`${owner.code} - ${owner.name}`, owner.id);
+                        ownerSelect.append(option);
+                    });
+                    if (budgetOwnerId && budgetBudgetType === budgetType) {
+                        ownerSelect.val(budgetOwnerId);
+                    }
+                } else {
+                    ownerSelect.html('<option value="">Error loading owners</option>');
+                }
+            },
+            error: function() {
+                ownerSelect.html('<option value="">Error loading owners</option>');
+            },
+            complete: function() {
+                ownerSelect.prop('disabled', false).trigger('change.select2');
+                ownerSelect.trigger('change');
+            }
+        });
+    }
 
     document.addEventListener('DOMContentLoaded', () => {
       const sidebar = document.getElementById('sidebar');
@@ -587,56 +666,35 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
         });
       }
 
+      $('.select2').select2({ theme: 'classic', width: '100%' });
+
       toggleBudgetType();
-      updateQuarter();
       refreshAvailability();
       fetchBudgets();
 
-      const owner = document.querySelector('select[name="owner_id"]');
-      const code  = document.getElementById('code_id');
-      const month = document.getElementById('month');
-      const date  = document.getElementById('adding_date');
-      const type  = document.getElementById('budget_type');
-
-      if (owner) owner.addEventListener('change', () => { refreshAvailability(); fetchBudgets(); });
-      if (code)  code.addEventListener('change', () => { refreshAvailability(); fetchBudgets(); });
-      if (month) month.addEventListener('change', refreshAvailability);
-      if (date)  date.addEventListener('change', refreshAvailability);
-      if (type)  type.addEventListener('change', () => { toggleBudgetType(); refreshAvailability(); fetchBudgets(); });
+      $('#owner_id').on('change', () => { refreshAvailability(); fetchBudgets(); });
+      $('#code_id').on('change', () => { refreshAvailability(); fetchBudgets(); });
+      $('#month').on('change', refreshAvailability);
+      $('#adding_date').on('change', refreshAvailability);
+      $('#budget_type').on('change', () => { toggleBudgetType(); fetchAndPopulateOwners(); refreshAvailability(); fetchBudgets(); });
     });
 
     function updateSelectedOwner(select) {
-      const selectedOption = select.options[select.selectedIndex];
-      const ownerName = selectedOption && selectedOption.text.includes(' - ')
-        ? selectedOption.text.split(' - ')[1] : '';
+      const selectedOption = $(select).find('option:selected');
+      const ownerName = selectedOption.length && selectedOption.text().includes(' - ')
+        ? selectedOption.text().split(' - ')[1] : '';
       const el = document.getElementById('selected_owner');
       if (el) el.textContent = ownerName;
     }
 
     function updateSelectedCode(select) {
-      const selectedOption = select.options[select.selectedIndex];
+      const selectedOption = $(select).find('option:selected');
       let codeName = '—';
-      if (selectedOption && selectedOption.value !== '' && selectedOption.text.includes(' - ')) {
-        codeName = selectedOption.text.split(' - ')[1];
+      if (selectedOption.length && selectedOption.val() !== '' && selectedOption.text().includes(' - ')) {
+        codeName = selectedOption.text().split(' - ')[1];
       }
       const el = document.getElementById('selected_code');
       if (el) el.textContent = codeName;
-    }
-
-    function updateQuarter() {
-      const monthSelect = document.getElementById('month');
-      if (!monthSelect) return;
-      const selectedMonth = monthSelect.value;
-      const quarterMap = {
-        'Meskerem': 1, 'Tikimt': 1, 'Hidar': 1,
-        'Tahsas': 2, 'Tir': 2, 'Yekatit': 2,
-        'Megabit': 3, 'Miazia': 3, 'Ginbot': 3,
-        'Sene': 4, 'Hamle': 4, 'Nehase': 4,
-        'Pagume': 4
-      };
-      const quarter = quarterMap[selectedMonth] || '—';
-      const qlbl = document.getElementById('quarter_label');
-      if (qlbl) qlbl.textContent = 'Q' + quarter;
     }
 
     function toggleBudgetType() {
@@ -644,39 +702,38 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
       const type = typeEl ? typeEl.value : 'governmental';
 
       const programBox = document.getElementById('program_name_box');
+      const codeBox   = document.getElementById('code_box');
       const monthBox   = document.getElementById('month_box');
       const mAmtBox    = document.getElementById('monthly_amount_box');
-      const qContainer = document.getElementById('quarter_container');
       const codeEl     = document.getElementById('code_id');
       const codeHint   = document.getElementById('code_required_hint');
       const monthlyAvailCard = document.getElementById('avail_monthly_card');
 
       if (type === '<?php echo $BUDGET_TYPE_PROGRAM; ?>') {
-        if (programBox) programBox.style.display = 'block';
-        if (monthBox)   monthBox.style.display = 'none';
-        if (mAmtBox)    mAmtBox.style.display = 'none';
-        if (qContainer) qContainer.style.display = 'none';
-        if (monthlyAvailCard) monthlyAvailCard.style.display = 'none';
-        if (codeEl) codeEl.required = false;
-        if (codeHint) codeHint.style.display = 'none';
-        const mAmt = document.getElementById('monthly_amount'); if (mAmt) mAmt.value = '';
+        programBox.style.display = 'block';
+        codeBox.style.display    = 'none';
+        monthBox.style.display   = 'none';
+        mAmtBox.style.display    = 'none';
+        monthlyAvailCard.style.display = 'none';
+        codeEl.required = false;
+        codeHint.style.display = 'none';
+        document.getElementById('monthly_amount').value = '';
       } else {
-        if (programBox) programBox.style.display = 'none';
-        if (monthBox)   monthBox.style.display = 'block';
-        if (mAmtBox)    mAmtBox.style.display = 'block';
-        if (qContainer) qContainer.style.display = 'block';
-        if (monthlyAvailCard) monthlyAvailCard.style.display = 'block';
-        if (codeEl) codeEl.required = true;
-        if (codeHint) codeHint.style.display = 'inline';
+        programBox.style.display = 'none';
+        codeBox.style.display    = 'block';
+        monthBox.style.display   = 'block';
+        mAmtBox.style.display    = 'block';
+        monthlyAvailCard.style.display = 'block';
+        codeEl.required = true;
+        codeHint.style.display = 'inline';
       }
     }
 
     async function refreshAvailability() {
       const type  = document.getElementById('budget_type')?.value || 'governmental';
-      const owner = document.querySelector('select[name="owner_id"]')?.value || '';
-      const code  = document.getElementById('code_id')?.value ?? '';
-      const monthEl = document.getElementById('month');
-      const month = monthEl ? monthEl.value : '';
+      const owner = $('#owner_id').val() || '';
+      const code  = $('#code_id').val() ?? '';
+      const month = $('#month').val() || '';
       const adding_date = document.getElementById('adding_date')?.value || new Date().toISOString().slice(0,10);
 
       if (!owner) {
@@ -702,10 +759,10 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
         const monthlyCard = document.getElementById('avail_monthly_card');
         const monthlyVal  = document.getElementById('avail_monthly');
         if (type === '<?php echo $BUDGET_TYPE_PROGRAM; ?>') {
-          if (monthlyCard) monthlyCard.style.display = 'none';
+          monthlyCard.style.display = 'none';
         } else {
-          if (monthlyCard) monthlyCard.style.display = 'block';
-          if (monthlyVal)  monthlyVal.textContent = formatMoney(j.monthlyAvailable);
+          monthlyCard.style.display = 'block';
+          monthlyVal.textContent = formatMoney(j.monthlyAvailable);
         }
       } catch (e) {
         document.getElementById('avail_yearly').textContent = '—';
@@ -715,8 +772,8 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
 
     async function fetchBudgets() {
       const type  = document.getElementById('budget_type')?.value || 'governmental';
-      const owner = document.querySelector('select[name="owner_id"]')?.value || '';
-      const code  = document.getElementById('code_id')?.value ?? '';
+      const owner = $('#owner_id').val() || '';
+      const code  = $('#code_id').val() ?? '';
 
       const url = new URL(window.location.href);
       url.searchParams.set('action','budgets');
@@ -726,8 +783,8 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
 
       const tbody = document.getElementById('budgets_tbody');
       const count = document.getElementById('budget_count');
-      if (tbody) tbody.innerHTML = `<tr><td class="px-4 py-3" colspan="9">Loading…</td></tr>`;
-      if (count) count.textContent = 'Loading…';
+      tbody.innerHTML = `<tr><td class="px-4 py-3" colspan="9">Loading…</td></tr>`;
+      count.textContent = 'Loading…';
 
       try {
         const r = await fetch(url.toString(), { cache: 'no-store' });
@@ -735,9 +792,8 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
         if (!j.ok) throw new Error(j.error || 'fetch failed');
 
         const rows = j.rows || [];
-        if (count) count.textContent = rows.length + ' row(s)';
+        count.textContent = rows.length + ' row(s)';
 
-        if (!tbody) return;
         if (rows.length === 0) {
           tbody.innerHTML = `<tr><td class="px-4 py-3" colspan="9">No data found for current filter.</td></tr>`;
           return;
@@ -767,7 +823,12 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
               <td class="px-4 py-2">
                 <div class="flex space-x-2">
                   <a href="?action=edit&id=${id}" class="btn btn-secondary btn-sm"><i class="fas fa-edit mr-1"></i> Edit</a>
-                  <a href="?action=delete&id=${id}" class="btn btn-danger btn-sm" onclick="return confirm('Are you sure?')"><i class="fas fa-trash mr-1"></i> Delete</a>
+                  <form method="POST" style="display:inline" onsubmit="return confirm('Delete this budget?')">
+                    <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['csrf']); ?>">
+                    <input type="hidden" name="action" value="delete">
+                    <input type="hidden" name="id" value="${id}">
+                    <button class="btn btn-danger btn-sm"><i class="fas fa-trash mr-1"></i> Delete</button>
+                  </form>
                 </div>
               </td>
             </tr>
@@ -775,8 +836,8 @@ if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']))
         });
         tbody.innerHTML = html;
       } catch (e) {
-        if (tbody) tbody.innerHTML = `<tr><td class="px-4 py-3" colspan="9">Failed to load budgets.</td></tr>`;
-        if (count) count.textContent = 'Error';
+        tbody.innerHTML = `<tr><td class="px-4 py-3" colspan="9">Failed to load budgets.</td></tr>`;
+        count.textContent = 'Error';
       }
     }
   </script>

@@ -1,6 +1,6 @@
 <?php
 require_once 'includes/init.php';
-require_once 'includes/sidebar.php';
+//require_once 'includes/sidebar.php';
 if (($_SESSION['role'] ?? '') !== 'admin') {
     $_SESSION['flash_error'] = 'You are not authorized to access that page.';
     header('Location: dashboard.php');
@@ -419,7 +419,7 @@ $message = $message ?? null;
 </head>
 <body class="text-slate-700 flex">
     <!-- Sidebar -->
-    
+      <?php require_once 'includes/sidebar.php'; ?>
     <!-- Main Content -->
     <div class="main-content" id="mainContent">
         <div class="p-6">
