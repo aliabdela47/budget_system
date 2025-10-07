@@ -1,6 +1,18 @@
 <?php
+ini_set('display_errors', 1);
+
 require_once 'includes/init.php';
-require_once 'includes/sidebar.php';
+//require_once 'includes/sidebar.php';
+
+// CSRF token
+if (empty($_SESSION['csrf'])) {
+    $_SESSION['csrf'] = bin2hex(random_bytes(32));
+}
+function csrf_check($t) { return hash_equals($_SESSION['csrf'] ?? '', $t ?? ''); }
+
+// Roles
+$is_admin   = (($_SESSION['role'] ?? '') === 'admin');
+$is_officer = (($_SESSION['role'] ?? '') === 'officer');
 
 // Role
 $is_officer = ($_SESSION['role'] == 'officer');
@@ -12,12 +24,104 @@ $stmt->execute([$user_id]);
 $user_data = $stmt->fetch(PDO::FETCH_ASSOC);
 $user_name = $user_data['name'] ?? $_SESSION['username'];
 
+// Get user's assigned budget types to determine default behavior
+$user_assigned_budgets = getUserAssignedBudgets($pdo, $user_id);
+$user_budget_types = [];
+foreach ($user_assigned_budgets as $budget) {
+    if (!in_array($budget['budget_type'], $user_budget_types)) {
+        $user_budget_types[] = $budget['budget_type'];
+    }
+}
+
+// Determine default budget type for this user
+$default_budget_type = 'governmental'; // Default fallback
+$budget_type_locked = false;
+
+if ($is_admin) {
+    // Admin can access both types, no locking
+    $default_budget_type = 'governmental';
+    $budget_type_locked = false;
+} else {
+    // Officer: determine based on assignments
+    if (count($user_budget_types) === 1) {
+        // User has only one budget type assigned
+        $default_budget_type = $user_budget_types[0];
+        $budget_type_locked = true;
+    } elseif (count($user_budget_types) > 1) {
+        // User has multiple budget types, default to first one but allow switching
+        $default_budget_type = $user_budget_types[0];
+        $budget_type_locked = false;
+    } else {
+        // User has no assignments, show governmental but locked
+        $default_budget_type = 'governmental';
+        $budget_type_locked = true;
+    }
+}
+
+// Enhanced Notification System - Fetch unread notifications
+$unread_notifications = [];
+$notifications_count = 0;
+try {
+    $stmt = $pdo->prepare("
+        SELECT id, title, message, type, is_read, created_at 
+        FROM notifications 
+        WHERE user_id = ? AND is_read = 0 
+        ORDER BY created_at DESC 
+        LIMIT 10
+    ");
+    $stmt->execute([$user_id]);
+    $unread_notifications = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $notifications_count = count($unread_notifications);
+} catch (Exception $e) {
+    // If notifications table doesn't exist, silently continue
+    error_log("Notifications error: " . $e->getMessage());
+}
+
+// Mark notification as read
+if (isset($_GET['mark_read']) && is_numeric($_GET['mark_read'])) {
+    try {
+        $stmt = $pdo->prepare("UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?");
+        $stmt->execute([$_GET['mark_read'], $user_id]);
+        
+        // Update local notifications array
+        foreach ($unread_notifications as $key => $notification) {
+            if ($notification['id'] == $_GET['mark_read']) {
+                unset($unread_notifications[$key]);
+            }
+        }
+        $notifications_count = count($unread_notifications);
+        
+        header('Location: fuel_management.php');
+        exit;
+    } catch (Exception $e) {
+        error_log("Mark read error: " . $e->getMessage());
+    }
+}
+
+// Mark all as read
+if (isset($_GET['mark_all_read'])) {
+    try {
+        $stmt = $pdo->prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0");
+        $stmt->execute([$user_id]);
+        $unread_notifications = [];
+        $notifications_count = 0;
+        
+        header('Location: fuel_management.php');
+        exit;
+    } catch (Exception $e) {
+        error_log("Mark all read error: " . $e->getMessage());
+    }
+}
+
 // Ensure columns exist (safe)
 try { $pdo->query("ALTER TABLE fuel_transactions ADD COLUMN p_koox VARCHAR(255) AFTER owner_id"); } catch (PDOException $e) {}
 try { $pdo->query("ALTER TABLE fuel_transactions ADD COLUMN budget_type ENUM('governmental','program') NOT NULL DEFAULT 'governmental' AFTER id"); } catch (PDOException $e) {}
 
-// Dropdown data
-$owners = $pdo->query("SELECT * FROM budget_owners ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
+// Get owners from both tables for the FILTER dropdown below the form - Using filtered budget owners based on user role
+$gov_owners = getFilteredBudgetOwners($pdo, $user_id, $_SESSION['role'], 'governmental');
+$prog_owners = getFilteredBudgetOwners($pdo, $user_id, $_SESSION['role'], 'program');
+
+// Get vehicles
 $vehicles = $pdo->query("SELECT * FROM vehicles ORDER BY plate_no")->fetchAll(PDO::FETCH_ASSOC);
 
 // Last price
@@ -26,6 +130,7 @@ $last_price = $pdo->query("SELECT fuel_price FROM fuel_transactions ORDER BY dat
 // Editing?
 $fuel = null;
 if (isset($_GET['action'], $_GET['id']) && $_GET['action'] === 'edit') {
+    if (!$is_admin) { http_response_code(403); exit('Forbidden'); }
     $stmt = $pdo->prepare("SELECT * FROM fuel_transactions WHERE id = ?");
     $stmt->execute([$_GET['id']]);
     $fuel = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -35,6 +140,14 @@ function ecYear(): int { return (int)date('Y') - 8; }
 
 // Handle POST (Add/Update)
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!in_array($_SESSION['role'] ?? '', ['admin','officer'], true)) { http_response_code(403); exit('Forbidden'); }
+    if (!csrf_check($_POST['csrf'] ?? '')) { http_response_code(400); exit('Bad CSRF'); }
+
+    $action = $_POST['action'] ?? '';
+    $is_update = ($action === 'update');
+    
+    if ($is_update && !$is_admin) { http_response_code(403); exit('Forbidden'); }
+
     $owner_id = $_POST['owner_id'] ?? '';
     $budget_type = ($_POST['budget_type'] ?? 'governmental') === 'program' ? 'program' : 'governmental';
     $driver_name = $_POST['driver_name'] ?? '';
@@ -47,12 +160,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $total_amount = (float)($_POST['total_amount'] ?? 0);
     $new_gauge = (float)($_POST['new_gauge'] ?? 0);
     $gauge_gap = (float)($_POST['gauge_gap'] ?? 0);
+    
+    // Budget access validation
+    if (!$is_admin && !hasBudgetAccess($pdo, $user_id, $budget_type, $owner_id)) { 
+        $_SESSION['message'] = 'You do not have access to this budget owner';
+        $_SESSION['message_type'] = 'error';
+        header('Location: fuel_management.php');
+        exit;
+    }
 
-    // p_koox from owners
-    $stmt = $pdo->prepare("SELECT p_koox FROM budget_owners WHERE id = ?");
-    $stmt->execute([$owner_id]);
-    $budget_owner = $stmt->fetch(PDO::FETCH_ASSOC);
-    $p_koox = $budget_owner['p_koox'] ?? '';
+    // p_koox applies only to governmental owners
+    $p_koox = null;
+    if ($budget_type === 'governmental') {
+        $stmt = $pdo->prepare("SELECT p_koox FROM budget_owners WHERE id = ?");
+        $stmt->execute([$owner_id]);
+        $budget_owner = $stmt->fetch(PDO::FETCH_ASSOC);
+        $p_koox = $budget_owner['p_koox'] ?? null;
+    }
 
     // Gauge continuity
     $stmt = $pdo->prepare("SELECT new_gauge FROM fuel_transactions WHERE plate_number = ? ORDER BY date DESC, id DESC LIMIT 1");
@@ -215,6 +339,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // Delete
 if (isset($_GET['action'], $_GET['id']) && $_GET['action'] === 'delete') {
+    if (!$is_admin) { http_response_code(403); exit('Forbidden'); }
     $stmt = $pdo->prepare("DELETE FROM fuel_transactions WHERE id = ?");
     $stmt->execute([$_GET['id']]);
     $_SESSION['message'] = 'Fuel transaction deleted';
@@ -230,36 +355,145 @@ unset($_SESSION['message'], $_SESSION['message_type']);
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="robots" content="noindex, nofollow">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Fuel Management - Budget System</title>
-  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-  <link href="../assets/css/materialize.css" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <link rel="stylesheet" href="css/sidebar.css">
-  <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+  <?php
+    // give this page a custom title
+    $pageTitle = 'F Management';
+    require_once 'includes/head.php';
+  ?>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Ethiopic:wght@400;500;600;700&display=swap');
-    body { font-family: 'Inter', sans-serif; }
-    .ethio-font { font-family: 'Noto Sans Ethiopic', sans-serif; }
-    .fade-out{opacity:1;transition:opacity .5s ease-out}.fade-out.hide{opacity:0}
-    .main-content { width: 100%; }
-    .select2-container--default .select2-selection--single{height:42px;border:1px solid #d1d5db;border-radius:.375rem}
-    .select2-container--default .select2-selection--single .select2-selection__rendered{line-height:40px;padding-left:12px}
-    .select2-container--default .select2-selection--single .select2-selection__arrow{height:40px}
-    .select2-container--default .select2-results__option--highlighted[aria-selected]{background-color:#4f46e5}
-    .info-card{background:linear-gradient(135deg,#f0f9ff 0%,#e0f2fe 100%);border-left:4px solid #3b82f6}
-    .program-card{background:linear-gradient(135deg,#f0f4ff 0%,#e0e7ff 100%);border-left:4px solid #6366f1}
-    .vehicle-card{background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);border-left:4px solid #22c55e}
-    .row-click { cursor:pointer; }
+    /* Enhanced Notification Styles */
+    .notification-bell {
+        position: relative;
+        padding: 8px 12px;
+        border-radius: 8px;
+        transition: all 0.3s ease;
+        cursor: pointer;
+    }
+    
+    .notification-bell:hover {
+        background: rgba(99, 102, 241, 0.1);
+    }
+    
+    .notification-badge {
+        position: absolute;
+        top: -5px;
+        right: -5px;
+        background: #ef4444;
+        color: white;
+        border-radius: 50%;
+        width: 18px;
+        height: 18px;
+        font-size: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: bold;
+        animation: pulse 2s infinite;
+    }
+    
+    @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.1); }
+        100% { transform: scale(1); }
+    }
+    
+    .notification-dropdown {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        width: 380px;
+        background: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+        z-index: 1000;
+        opacity: 0;
+        visibility: hidden;
+        transform: translateY(-10px);
+        transition: all 0.3s ease;
+    }
+    
+    .notification-dropdown.show {
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(0);
+    }
+    
+    .notification-header {
+        padding: 16px;
+        border-bottom: 1px solid #e5e7eb;
+        display: flex;
+        justify-content: between;
+        align-items: center;
+    }
+    
+    .notification-list {
+        max-height: 400px;
+        overflow-y: auto;
+    }
+    
+    .notification-item {
+        padding: 12px 16px;
+        border-bottom: 1px solid #f3f4f6;
+        transition: background 0.2s ease;
+        cursor: pointer;
+    }
+    
+    .notification-item:hover {
+        background: #f9fafb;
+    }
+    
+    .notification-item.unread {
+        background: #f0f9ff;
+        border-left: 3px solid #3b82f6;
+    }
+    
+    .notification-title {
+        font-weight: 600;
+        color: #1f2937;
+        margin-bottom: 4px;
+    }
+    
+    .notification-message {
+        color: #6b7280;
+        font-size: 14px;
+        line-height: 1.4;
+    }
+    
+    .notification-time {
+        color: #9ca3af;
+        font-size: 12px;
+        margin-top: 4px;
+    }
+    
+    .notification-actions {
+        padding: 12px 16px;
+        border-top: 1px solid #e5e7eb;
+        text-align: center;
+    }
+    
+    .empty-notifications {
+        padding: 32px 16px;
+        text-align: center;
+        color: #9ca3af;
+    }
+    
+    .notification-type-indicator {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 6px;
+    }
+    
+    .type-success { background: #10b981; }
+    .type-warning { background: #f59e0b; }
+    .type-error { background: #ef4444; }
+    .type-info { background: #3b82f6; }
   </style>
 </head>
 <body class="text-slate-700 flex bg-gray-100 min-h-screen">
-  <!-- Sidebar -->
-  
+  <?php require_once 'includes/sidebar.php'; ?>
 
   <!-- Main Content -->
   <div class="main-content" id="mainContent">
@@ -277,6 +511,60 @@ unset($_SESSION['message'], $_SESSION['message_type']);
           </div>
         </div>
         <div class="flex items-center space-x-4 mt-4 md:mt-0">
+          <!-- Enhanced Notification Bell -->
+          <div class="notification-bell relative" id="notificationBell">
+            <i class="fas fa-bell text-xl text-slate-600"></i>
+            <?php if ($notifications_count > 0): ?>
+              <span class="notification-badge" id="notificationCount"><?php echo $notifications_count; ?></span>
+            <?php endif; ?>
+            
+            <!-- Notification Dropdown -->
+            <div class="notification-dropdown" id="notificationDropdown">
+              <div class="notification-header">
+                <h3 class="text-lg font-semibold text-slate-800">Notifications</h3>
+                <?php if ($notifications_count > 0): ?>
+                  <a href="?mark_all_read=1" class="text-sm text-blue-600 hover:text-blue-800">Mark all as read</a>
+                <?php endif; ?>
+              </div>
+              
+              <div class="notification-list">
+                <?php if (empty($unread_notifications)): ?>
+                  <div class="empty-notifications">
+                    <i class="fas fa-bell-slash text-3xl text-gray-300 mb-3"></i>
+                    <p class="text-gray-500">No new notifications</p>
+                  </div>
+                <?php else: ?>
+                  <?php foreach ($unread_notifications as $notification): ?>
+                    <div class="notification-item unread" data-id="<?php echo $notification['id']; ?>">
+                      <div class="flex items-start">
+                        <span class="notification-type-indicator type-<?php echo $notification['type'] ?? 'info'; ?>"></span>
+                        <div class="flex-1">
+                          <div class="notification-title"><?php echo htmlspecialchars($notification['title']); ?></div>
+                          <div class="notification-message"><?php echo htmlspecialchars($notification['message']); ?></div>
+                          <div class="notification-time">
+                            <?php echo date('M j, Y g:i A', strtotime($notification['created_at'])); ?>
+                          </div>
+                        </div>
+                        <button class="mark-read-btn text-gray-400 hover:text-gray-600 ml-2" 
+                                onclick="markNotificationRead(<?php echo $notification['id']; ?>)">
+                          <i class="fas fa-check"></i>
+                        </button>
+                      </div>
+                    </div>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </div>
+              
+              <?php if (!empty($unread_notifications)): ?>
+                <div class="notification-actions">
+                  <a href="?mark_all_read=1" class="text-blue-600 hover:text-blue-800 text-sm font-medium">
+                    <i class="fas fa-check-double mr-1"></i>Mark all as read
+                  </a>
+                </div>
+              <?php endif; ?>
+            </div>
+          </div>
+          
           <button class="bg-slate-200 hover:bg-slate-300 text-slate-700 p-2 rounded-lg md:hidden shadow-sm" id="sidebarToggle">
             <i class="fas fa-bars"></i>
           </button>
@@ -305,35 +593,40 @@ unset($_SESSION['message'], $_SESSION['message_type']);
             <input type="hidden" name="id" value="<?php echo $fuel['id']; ?>">
             <input type="hidden" name="action" value="update">
           <?php endif; ?>
+          <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['csrf']); ?>">
 
           <!-- Top row -->
           <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
             <!-- Budget Source Type -->
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Budget Source Type *</label>
-              <select name="budget_type" id="budget_type" class="w-full select2">
-                <option value="governmental" <?php echo isset($fuel) ? ($fuel['budget_type']==='governmental' ? 'selected' : '') : 'selected'; ?>>Government Budget</option>
-                <option value="program" <?php echo isset($fuel) && $fuel['budget_type']==='program' ? 'selected' : ''; ?>>Programs Budget</option>
+              <select name="budget_type" id="budget_type" class="w-full select2" <?php echo $budget_type_locked ? 'disabled' : ''; ?>>
+                <option value="governmental" <?php 
+                  if (isset($fuel)) {
+                    echo $fuel['budget_type']==='governmental' ? 'selected' : '';
+                  } else {
+                    echo $default_budget_type === 'governmental' ? 'selected' : '';
+                  }
+                ?>>Government Budget</option>
+                <option value="program" <?php 
+                  if (isset($fuel)) {
+                    echo $fuel['budget_type']==='program' ? 'selected' : '';
+                  } else {
+                    echo $default_budget_type === 'program' ? 'selected' : '';
+                  }
+                ?>>Programs Budget</option>
               </select>
+              <?php if ($budget_type_locked): ?>
+                <input type="hidden" name="budget_type" value="<?php echo $default_budget_type; ?>">
+                <p class="text-xs text-gray-500 mt-1">Budget source is automatically set based on your assignments</p>
+              <?php endif; ?>
             </div>
 
             <!-- Budget Owner -->
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Budget Owner *</label>
               <select name="owner_id" id="owner_id" required class="w-full select2">
-                <option value="">Select Owner</option>
-                <?php foreach ($owners as $o): ?>
-                  <option value="<?php echo $o['id']; ?>"
-                          data-p_koox="<?php echo htmlspecialchars($o['p_koox'] ?? ''); ?>"
-                          <?php
-                          $sel = false;
-                          if (isset($fuel) && $fuel['owner_id'] == $o['id']) $sel = true;
-                          if (isset($_POST['owner_id']) && $_POST['owner_id'] == $o['id']) $sel = true;
-                          echo $sel ? 'selected' : '';
-                          ?>>
-                    <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
-                  </option>
-                <?php endforeach; ?>
+                <option value="">Loading your budget owners...</option>
               </select>
             </div>
 
@@ -413,15 +706,14 @@ unset($_SESSION['message'], $_SESSION['message_type']);
               </div>
             </div>
           </div>
-
-          <!-- Numbers -->
+    <!-- Numbers -->
           <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
             <div>
-              <label class="block text-sm font-medium text-slate-700 mb-1">Current Gauge *</label>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Previous Gauge *</label>
               <input type="number" step="0.01" name="current_gauge" id="current" value="<?php
                 echo isset($fuel) ? $fuel['current_gauge'] : (isset($_POST['current_gauge']) ? $_POST['current_gauge'] : '');
               ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" oninput="calculateFuel()">
-            </div>
+</div>
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Journey Distance (km) *</label>
               <input type="number" step="0.01" name="journey_distance" id="journey" value="<?php
@@ -483,7 +775,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
               <div class="flex items-center gap-3">
                 <div class="p-3 rounded-full bg-purple-200 text-purple-800"><i class="fas fa-layer-group"></i></div>
                 <div>
-                  <div class="text-sm text-purple-700 font-medium">Bureau’s Programs Total Budget</div>
+                  <div class="text-sm text-purple-700 font-medium">Bureau's Programs Total Budget</div>
                   <div id="programs_total_amount" class="text-2xl font-extrabold text-purple-900 mt-1">0.00 ብር</div>
                 </div>
               </div>
@@ -495,7 +787,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
             <div class="flex items-center gap-3">
               <div class="p-3 rounded-full bg-purple-200 text-purple-800"><i class="fas fa-building"></i></div>
               <div>
-                <div id="gov_grand_label" class="text-sm text-purple-700 font-medium">Bureau’s Yearly Government Budget</div>
+                <div id="gov_grand_label" class="text-sm text-purple-700 font-medium">Bureau's Yearly Government Budget</div>
                 <div id="gov_grand_amount" class="text-2xl font-extrabold text-purple-900 mt-1">0.00 ብር</div>
               </div>
             </div>
@@ -517,18 +809,35 @@ unset($_SESSION['message'], $_SESSION['message_type']);
         <div class="grid md:grid-cols-4 gap-3">
           <div>
             <label class="block text-sm font-medium mb-1">Budget Source</label>
-            <select id="flt_type" class="w-full select2">
-              <option value="governmental">Government</option>
-              <option value="program">Programs</option>
+            <select id="flt_type" class="w-full select2" <?php echo $budget_type_locked ? 'disabled' : ''; ?>>
+              <option value="governmental" <?php echo $default_budget_type === 'governmental' ? 'selected' : ''; ?>>Government</option>
+              <option value="program" <?php echo $default_budget_type === 'program' ? 'selected' : ''; ?>>Programs</option>
             </select>
+            <?php if ($budget_type_locked): ?>
+              <input type="hidden" id="flt_type_hidden" value="<?php echo $default_budget_type; ?>">
+            <?php endif; ?>
           </div>
           <div>
             <label class="block text-sm font-medium mb-1">Owner</label>
             <select id="flt_owner" class="w-full select2">
               <option value="">Any Owner</option>
-              <?php foreach ($owners as $o): ?>
-                <option value="<?php echo $o['id']; ?>"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
-              <?php endforeach; ?>
+              <?php if ($is_admin): ?>
+                <!-- Admin sees all owners -->
+                <?php foreach ($gov_owners as $o): ?>
+                  <option value="<?php echo $o['id']; ?>" data-budget-type="governmental"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
+                <?php endforeach; ?>
+                <?php foreach ($prog_owners as $o): ?>
+                  <option value="<?php echo $o['id']; ?>" data-budget-type="program"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
+                <?php endforeach; ?>
+              <?php else: ?>
+                <!-- Officer sees only assigned owners -->
+                <?php foreach ($gov_owners as $o): ?>
+                  <option value="<?php echo $o['id']; ?>" data-budget-type="governmental"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
+                <?php endforeach; ?>
+                <?php foreach ($prog_owners as $o): ?>
+                  <option value="<?php echo $o['id']; ?>" data-budget-type="program"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
+                <?php endforeach; ?>
+              <?php endif; ?>
             </select>
           </div>
           <div id="flt_month_box">
@@ -589,9 +898,86 @@ unset($_SESSION['message'], $_SESSION['message_type']);
     const defaultFuelPrice = <?php echo json_encode((float)$last_price); ?>;
     let filling = false; // guard to suppress change handlers during programmatic fill
     const isEdit = <?php echo isset($fuel) ? 'true' : 'false'; ?>;
+    const isAdmin = <?php echo $is_admin ? 'true' : 'false'; ?>;
+    const isOfficer = <?php echo $is_officer ? 'true' : 'false'; ?>;
+    const csrfToken = <?php echo json_encode($_SESSION['csrf']); ?>;
+    const defaultBudgetType = <?php echo json_encode($default_budget_type); ?>;
+    const budgetTypeLocked = <?php echo $budget_type_locked ? 'true' : 'false'; ?>;
 
     function fmt(n){return (Number(n)||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
     function birr(n){return fmt(n)+' ብር';}
+
+    // Enhanced Notification Functions
+    function toggleNotifications() {
+        const dropdown = document.getElementById('notificationDropdown');
+        dropdown.classList.toggle('show');
+    }
+
+    function markNotificationRead(notificationId) {
+        fetch(`?mark_read=${notificationId}`, {
+            method: 'GET',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+        })
+        .then(response => response.text())
+        .then(() => {
+            // Remove the notification from UI
+            const notificationItem = document.querySelector(`.notification-item[data-id="${notificationId}"]`);
+            if (notificationItem) {
+                notificationItem.remove();
+            }
+            
+            // Update badge count
+            updateNotificationBadge();
+            
+            // If no notifications left, show empty state
+            const notificationList = document.querySelector('.notification-list');
+            const notifications = notificationList.querySelectorAll('.notification-item');
+            if (notifications.length === 0) {
+                notificationList.innerHTML = `
+                    <div class="empty-notifications">
+                        <i class="fas fa-bell-slash text-3xl text-gray-300 mb-3"></i>
+                        <p class="text-gray-500">No new notifications</p>
+                    </div>
+                `;
+                document.querySelector('.notification-actions').style.display = 'none';
+            }
+        })
+        .catch(error => console.error('Error marking notification as read:', error));
+    }
+
+    function updateNotificationBadge() {
+        const badge = document.getElementById('notificationCount');
+        const notificationItems = document.querySelectorAll('.notification-item');
+        const count = notificationItems.length;
+        
+        if (badge) {
+            if (count === 0) {
+                badge.remove();
+            } else {
+                badge.textContent = count;
+            }
+        } else if (count > 0) {
+            // Create badge if it doesn't exist
+            const bell = document.getElementById('notificationBell');
+            const newBadge = document.createElement('span');
+            newBadge.id = 'notificationCount';
+            newBadge.className = 'notification-badge';
+            newBadge.textContent = count;
+            bell.appendChild(newBadge);
+        }
+    }
+
+    // Close notifications when clicking outside
+    document.addEventListener('click', function(event) {
+        const bell = document.getElementById('notificationBell');
+        const dropdown = document.getElementById('notificationDropdown');
+        
+        if (!bell.contains(event.target) && !dropdown.contains(event.target)) {
+            dropdown.classList.remove('show');
+        }
+    });
 
     function calculateFuel() {
       const current = parseFloat($('#current').val()) || 0;
@@ -648,6 +1034,8 @@ unset($_SESSION['message'], $_SESSION['message_type']);
     }
 
     function resetFuelFormOnTypeSwitch(){
+      if (budgetTypeLocked) return; // Don't reset if budget type is locked
+      
       filling = true;
       $('#owner_id').val('').trigger('change.select2');
       $('#et_month').val('').trigger('change.select2');
@@ -685,9 +1073,112 @@ unset($_SESSION['message'], $_SESSION['message_type']);
     }
 
     function onBudgetTypeChange(){
+      if (budgetTypeLocked) return; // Don't allow changes if budget type is locked
+      
       const t = $('#budget_type').val();
       setBudgetTypeUI(t);
       resetFuelFormOnTypeSwitch();
+    }
+
+    function fetchAndPopulateOwners(preselectId=null) {
+        const budgetType = $('#budget_type').val();
+        const ownerSelect = $('#owner_id');
+        
+        // Data needed to re-select the owner when in edit mode
+        const fuelOwnerId = '<?php echo $fuel['owner_id'] ?? ''; ?>';
+        const fuelBudgetType = '<?php echo $fuel['budget_type'] ?? ''; ?>';
+
+        ownerSelect.prop('disabled', true).html('<option value="">Loading...</option>').trigger('change.select2');
+
+        $.ajax({
+            url: 'ajax_get_owners.php',
+            type: 'GET',
+            data: { budget_type: budgetType },
+            dataType: 'json',
+            success: function(response) {
+                if (response.success && Array.isArray(response.owners)) {
+                    ownerSelect.html('<option value="">Select Owner</option>'); // Clear and add default
+                    if (response.owners.length === 0) {
+                        ownerSelect.html('<option value="">No budget owners assigned to your account</option>');
+                    } else {
+                        response.owners.forEach(function(owner) {
+                            const option = new Option(`${owner.code} - ${owner.name}`, owner.id);
+                            $(option).data('p_koox', owner.p_koox || '');
+                            ownerSelect.append(option);
+                        });
+                        
+                        // If in edit mode, re-select the correct owner if the budget type matches
+                        if (preselectId) {
+                            ownerSelect.val(String(preselectId));
+                        } else if (isEdit && fuelOwnerId && fuelBudgetType === budgetType) {
+                            ownerSelect.val(String(fuelOwnerId));
+                        }
+                    }
+                } else {
+                    ownerSelect.html('<option value="">Error loading owners</option>');
+                }
+            },
+            error: function() {
+                ownerSelect.html('<option value="">Error loading owners</option>');
+            },
+            complete: function() {
+                ownerSelect.prop('disabled', false).trigger('change.select2');
+                // If a value is selected (especially in edit mode), trigger change
+                // to update other UI elements like the Program Details card.
+                if (ownerSelect.val()) {
+                    ownerSelect.trigger('change');
+                }
+            }
+        });
+    }
+
+    function updateFilterOwnerOptions() {
+        const budgetType = $('#flt_type').val();
+        const fltOwnerSelect = $('#flt_owner');
+        
+        // For officers, we need to reload the filter options based on current budget type
+        if (!isAdmin) {
+            // Clear and disable while loading
+            fltOwnerSelect.prop('disabled', true).html('<option value="">Loading...</option>').trigger('change.select2');
+            
+            $.ajax({
+                url: 'ajax_get_owners.php',
+                type: 'GET',
+                data: { budget_type: budgetType },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success && Array.isArray(response.owners)) {
+                        fltOwnerSelect.html('<option value="">Any Owner</option>');
+                        response.owners.forEach(function(owner) {
+                            const option = new Option(`${owner.code} - ${owner.name}`, owner.id);
+                            $(option).data('budget-type', budgetType);
+                            fltOwnerSelect.append(option);
+                        });
+                    } else {
+                        fltOwnerSelect.html('<option value="">Error loading owners</option>');
+                    }
+                },
+                error: function() { 
+                    fltOwnerSelect.html('<option value="">Error loading owners</option>'); 
+                },
+                complete: function() {
+                    fltOwnerSelect.prop('disabled', false).trigger('change.select2');
+                }
+            });
+        } else {
+            // Admin logic remains the same
+            fltOwnerSelect.find('option').each(function() {
+                const option = $(this);
+                const optionBudgetType = option.data('budget-type');
+                if (!optionBudgetType || optionBudgetType === budgetType) {
+                    option.prop('disabled', false);
+                } else {
+                    option.prop('disabled', true);
+                    if (option.is(':selected')) fltOwnerSelect.val('');
+                }
+            });
+            fltOwnerSelect.trigger('change.select2');
+        }
     }
 
     function onOwnerChange(){
@@ -815,7 +1306,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
             $('#programs_total_card').hide();
             if (!ownerId) {
               $('#government_grand_card').show();
-              $('#gov_grand_label').text("Bureau’s Yearly Government Budget");
+              $('#gov_grand_label').text("Bureau's Yearly Government Budget");
               $('#gov_grand_amount').text(birr(j.govtBureauRemainingYearly || 0));
             } else {
               $('#government_grand_card').show();
@@ -868,9 +1359,24 @@ unset($_SESSION['message'], $_SESSION['message_type']);
           let html='';
           rows.forEach(f=>{
             const printUrl = (f.budget_type==='program')
-              ? `reports/fuel_transaction_report2.php?id=${f.id}`
+              ? `reports/fuel_transaction_report.php?id=${f.id}`
               : `reports/fuel_transaction_report.php?id=${f.id}`;
             const dataJson = encodeURIComponent(JSON.stringify(f));
+            let actions = `
+              <a href="${printUrl}" class="px-3 py-1 bg-green-100 text-green-700 rounded-md hover:bg-green-200" target="_blank">
+                <i class="fas fa-print mr-1"></i> Print
+              </a>
+            `;
+            <?php if ($is_admin): ?>
+            actions += `
+              <a href="?action=edit&id=${f.id}" class="px-3 py-1 bg-blue-100 text-blue-700 rounded-md hover:bg-blue-200">
+                <i class="fas fa-edit mr-1"></i> Edit
+              </a>
+              <a href="?action=delete&id=${f.id}" class="px-3 py-1 bg-red-100 text-red-700 rounded-md hover:bg-red-200" onclick="return confirm('Are you sure you want to delete this transaction?')">
+                <i class="fas fa-trash mr-1"></i> Delete
+              </a>
+            `;
+            <?php endif; ?>
             html += `
               <tr class="row-click" data-json="${dataJson}">
                 <td class="px-4 py-4 text-sm text-gray-900">${(f.date||'').replace('T',' ').slice(0,19)}</td>
@@ -879,21 +1385,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
                 <td class="px-4 py-4 text-sm text-gray-900">${f.plate_number || ''}</td>
                 <td class="px-4 py-4 text-sm text-gray-900 ethio-font">${f.et_month || ''}</td>
                 <td class="px-4 py-4 text-sm text-gray-900">${Number(f.total_amount||0).toLocaleString(undefined,{minimumFractionDigits:2})}</td>
-                <td class="px-4 py-4 text-sm">
-                  <div class="flex space-x-2">
-                    <a href="${printUrl}" class="px-3 py-1 bg-green-100 text-green-700 rounded-md hover:bg-green-200" target="_blank">
-                      <i class="fas fa-print mr-1"></i> Print
-                    </a>
-                    <?php if ($_SESSION['role'] == 'admin'): ?>
-                    <a href="?action=edit&id=\${f.id}" class="px-3 py-1 bg-blue-100 text-blue-700 rounded-md hover:bg-blue-200">
-                      <i class="fas fa-edit mr-1"></i> Edit
-                    </a>
-                    <a href="?action=delete&id=\${f.id}" class="px-3 py-1 bg-red-100 text-red-700 rounded-md hover:bg-red-200" onclick="return confirm('Are you sure you want to delete this transaction?')">
-                      <i class="fas fa-trash mr-1"></i> Delete
-                    </a>
-                    <?php endif; ?>
-                  </div>
-                </td>
+                <td class="px-4 py-4 text-sm"><div class="flex space-x-2">${actions}</div></td>
               </tr>`;
           });
           $('#transactionsTable').html(html);
@@ -921,6 +1413,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
         // Budget type
         $('#budget_type').val(d.budget_type || 'governmental').trigger('change.select2');
         setBudgetTypeUI($('#budget_type').val()); // UI only, no reset
+        fetchAndPopulateOwners(d.owner_id); // Fetch owners and it will re-select the correct one
 
         // Owner
         $('#owner_id').val(String(d.owner_id||'')).trigger('change.select2');
@@ -960,6 +1453,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
 
         // Sync lower filters to match this row
         $('#flt_type').val(d.budget_type || 'governmental').trigger('change.select2');
+        updateFilterOwnerOptions(); // Update filter options
         $('#flt_owner').val(String(d.owner_id||'')).trigger('change.select2');
         if ((d.budget_type||'governmental') !== 'program') {
           $('#flt_month').val(d.et_month || '').trigger('change.select2');
@@ -993,14 +1487,23 @@ unset($_SESSION['message'], $_SESSION['message_type']);
         }
       });
 
+      // Set the default budget type on page load
+      if (!isEdit) {
+        $('#budget_type').val(defaultBudgetType);
+        $('#flt_type').val(defaultBudgetType);
+      }
+
       // Main form dropdowns drive filtering and form behavior
-      $('#budget_type').on('change', function(){
-        if (filling) return;
-        onBudgetTypeChange();
-        $('#flt_type').val($('#budget_type').val()).trigger('change.select2');
-        toggleFilterMonth();
-        fetchFuelList();
-      });
+      if (!budgetTypeLocked) {
+        $('#budget_type').on('change', function(){
+          if (filling) return;
+          onBudgetTypeChange();
+          fetchAndPopulateOwners(); // Fetch new owner list
+          $('#flt_type').val($('#budget_type').val()).trigger('change.select2');
+          toggleFilterMonth();
+          fetchFuelList();
+        });
+      }
 
       $('#owner_id').on('change', function(){
         if (filling) return;
@@ -1033,6 +1536,18 @@ unset($_SESSION['message'], $_SESSION['message_type']);
         fetchFuelList();
       });
 
+      // Filter changes
+      if (!budgetTypeLocked) {
+        $('#flt_type').on('change', function(){
+          updateFilterOwnerOptions(); // Sync filter owners
+          toggleFilterMonth();
+          fetchFuelList();
+        });
+      }
+      $('#flt_owner, #flt_month').on('change', function(){
+        fetchFuelList();
+      });
+
       // Make table rows clickable to populate form
       $('#transactionsTable').on('click', 'tr.row-click', function(e){
         if ($(e.target).closest('a,button').length) return;
@@ -1049,9 +1564,9 @@ unset($_SESSION['message'], $_SESSION['message_type']);
       // INITIALIZE
       if (isEdit) {
         setBudgetTypeUI($('#budget_type').val()); // UI only, no reset
+        fetchAndPopulateOwners(); // Fetch owners and it will re-select the correct one
         filling = true;
         $('#budget_type').trigger('change.select2');
-        $('#owner_id').trigger('change.select2');
         $('#plate_number').trigger('change.select2');
         <?php if (!empty($fuel) && $fuel['budget_type']!=='program'): ?>
           $('#et_month').trigger('change.select2');
@@ -1066,6 +1581,7 @@ unset($_SESSION['message'], $_SESSION['message_type']);
 
         // Sync filters to form
         $('#flt_type').val($('#budget_type').val()).trigger('change.select2');
+        updateFilterOwnerOptions(); // Update filter options
         $('#flt_owner').val($('#owner_id').val()).trigger('change.select2');
         $('#flt_plate').val($('#plate_number').val()).trigger('change.select2');
         $('#flt_month').val($('#et_month').val()).trigger('change.select2');
@@ -1073,6 +1589,8 @@ unset($_SESSION['message'], $_SESSION['message_type']);
         fetchFuelList();
       } else {
         setBudgetTypeUI($('#budget_type').val()); // UI only
+        fetchAndPopulateOwners(); // Fetch initial owners
+        updateFilterOwnerOptions(); // Sync filter dropdowns on initial load
         calculateFuel();
         loadFuelRemaining();
         refreshGrandTotals();
@@ -1090,6 +1608,9 @@ unset($_SESSION['message'], $_SESSION['message_type']);
       document.getElementById('sidebar').classList.toggle('collapsed');
       document.getElementById('mainContent').classList.toggle('expanded');
     });
+
+    // Initialize notification bell click handler
+    document.getElementById('notificationBell')?.addEventListener('click', toggleNotifications);
   </script>
 </body>
 </html>
