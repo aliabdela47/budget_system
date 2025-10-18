@@ -11,10 +11,12 @@
     "require": {
         "php": ">=8.1",
         "ext-gd": "*",
-        "google/cloud-ai-platform": "^1.37",
-        "erusev/parsedown": "^1.7",
-        "phpmailer/phpmailer": "^6.9",
         "andegna/calender": "^2.4",
+        "erusev/parsedown": "^1.7",
+        "google/cloud-ai-platform": "^1.37",
+        "phpmailer/phpmailer": "^6.9",
+        "phpoffice/phpspreadsheet": "^5.1",
+        "setasign/fpdf": "^1.8",
         "tecnickcom/tc-lib-pdf": "dev-main"
     },
     "require-dev": {
