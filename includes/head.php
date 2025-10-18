@@ -45,7 +45,8 @@
         animation: {
           'fade-in': 'fadeIn 0.5s ease-in-out',
           'slide-in': 'slideIn 0.3s ease-out',
-          'bounce-soft': 'bounceSoft 2s infinite'
+          'bounce-soft': 'bounceSoft 2s infinite',
+          'slide-in-left': 'slideInLeft 0.3s ease-out'
         },
         keyframes: {
           fadeIn: {
@@ -54,6 +55,10 @@
           },
           slideIn: {
             '0%': { opacity: '0', transform: 'translateX(-20px)' },
+            '100%': { opacity: '1', transform: 'translateX(0)' }
+          },
+          slideInLeft: {
+            '0%': { opacity: '0', transform: 'translateX(-100%)' },
             '100%': { opacity: '1', transform: 'translateX(0)' }
           },
           bounceSoft: {
@@ -72,6 +77,7 @@
         font-family: 'Inter', sans-serif;
         background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
         min-height: 100vh;
+        overflow-x: hidden;
     }
     
     .ethio-font { 
@@ -87,13 +93,30 @@
         opacity: 0;
     }
     
+    /* Main content area with sidebar integration */
     .main-content { 
         width: 100%;
-        transition: margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        min-height: 100vh;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        margin-left: 16rem; /* Default desktop sidebar width */
     }
     
-    .main-content.expanded {
-        margin-left: 0;
+    /* Expanded state when sidebar is collapsed */
+    .main-content.sidebar-collapsed {
+        margin-left: 5rem;
+    }
+    
+    /* Mobile state */
+    @media (max-width: 1023px) {
+        .main-content {
+            margin-left: 0 !important;
+        }
+    }
+    
+    /* Sidebar overlay for mobile */
+    .sidebar-overlay {
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
     }
     
     /* Enhanced Select2 Styling */
@@ -187,6 +210,20 @@
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 16px;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+    }
+    
+    /* User Dropdown Styles */
+    .user-dropdown {
+        opacity: 0;
+        visibility: hidden;
+        transform: translateY(-10px);
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    
+    .user-dropdown.show {
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(0);
     }
 </style>
 
