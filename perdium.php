@@ -191,6 +191,16 @@ function reverseAllocations(PDO $pdo, int $perdium_id): int {
     return $count;
 }
 
+// Helper to ensure unique monthly budget row
+function ensureUniqueMonthlyBudget(PDO $pdo, int $owner_id, int $code_id, int $year, string $et_month): void {
+    $s = $pdo->prepare("SELECT COUNT(*) FROM budgets WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND month = ?");
+    $s->execute([$owner_id, $code_id, $year, $et_month]);
+    $count = (int)$s->fetchColumn();
+    if ($count > 1) {
+        throw new Exception("Multiple budget rows found for this monthly key. Please run the diagnostic script (tools/diagnose_budget_dupes.php) and apply the unique index migration.");
+    }
+}
+
 // Legacy best-effort reversal (when no ledger rows exist)
 function reverseLegacy(PDO $pdo, array $tx): void {
     $amount = (float)$tx['total_amount'];
@@ -217,25 +227,22 @@ function reverseLegacy(PDO $pdo, array $tx): void {
             ->execute([$amount, (int)$b['id']]);
         }
     } else {
-        // Governmental monthly first then yearly
-        $month = $tx['et_month'];
-        if (!empty($month)) {
-            $r = $pdo->prepare("SELECT id FROM budgets WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND month = ? FOR UPDATE");
-            $r->execute([$owner_id, $code_id, $year, $month]);
-            $b = $r->fetch(PDO::FETCH_ASSOC);
-            if ($b) {
-                $pdo->prepare("UPDATE budgets SET remaining_monthly = remaining_monthly + ? WHERE id = ?")
-                ->execute([$amount, (int)$b['id']]);
-                return;
-            }
+        // Governmental: strict monthly-only reversal
+        $month = $tx['et_month'] ?? '';
+        if (empty($month)) {
+            throw new Exception('Ethiopian month is required for governmental budget reversal. Cannot reverse legacy transactions without month data.');
         }
-        $r = $pdo->prepare("SELECT id FROM budgets WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0 FOR UPDATE");
-        $r->execute([$owner_id, $code_id, $year]);
+        
+        ensureUniqueMonthlyBudget($pdo, $owner_id, $code_id, $year, $month);
+        
+        $r = $pdo->prepare("SELECT id FROM budgets WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND month = ? FOR UPDATE");
+        $r->execute([$owner_id, $code_id, $year, $month]);
         $b = $r->fetch(PDO::FETCH_ASSOC);
-        if ($b) {
-            $pdo->prepare("UPDATE budgets SET remaining_yearly = remaining_yearly + ? WHERE id = ?")
-            ->execute([$amount, (int)$b['id']]);
+        if (!$b) {
+            throw new Exception("No monthly budget row found for reversal. Cannot reverse to non-existent monthly budget.");
         }
+        $pdo->prepare("UPDATE budgets SET remaining_monthly = remaining_monthly + ? WHERE id = ?")
+        ->execute([$amount, (int)$b['id']]);
     }
 }
 
@@ -297,38 +304,35 @@ function allocateProgram(PDO $pdo, int $owner_id, int $year, float $amount): arr
     return $allocs;
 }
 function allocateGovernment(PDO $pdo, int $owner_id, int $year, string $et_month, float $amount, int $code_id = 6): array {
-    // Monthly first (lock row)
+    if (empty($et_month)) {
+        throw new Exception('Ethiopian month is required for governmental budget allocation.');
+    }
+    
+    // Ensure unique monthly budget row
+    ensureUniqueMonthlyBudget($pdo, $owner_id, $code_id, $year, $et_month);
+    
+    // Strict monthly-only: lock and deduct from monthly row
     $s = $pdo->prepare("SELECT id, remaining_monthly FROM budgets
                         WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND month = ?
                         FOR UPDATE");
     $s->execute([$owner_id, $code_id, $year, $et_month]);
     $b = $s->fetch(PDO::FETCH_ASSOC);
-    if ($b) {
-        $newRem = (float)$b['remaining_monthly'] - $amount;
-        if ($newRem < 0) throw new Exception('Insufficient remaining monthly budget for perdium.');
-        $pdo->prepare("UPDATE budgets SET remaining_monthly = ? WHERE id = ?")
-        ->execute([$newRem, (int)$b['id']]);
-        return [[
-            'budget_type' => 'governmental',
-            'gov_budget_id' => (int)$b['id'],
-            'prog_budget_id' => null,
-            'amount' => $amount
-        ]];
+    
+    if (!$b) {
+        throw new Exception('No monthly perdium budget allocated for the selected month. Please ensure a monthly budget exists.');
     }
-    // Yearly fallback
-    $s = $pdo->prepare("SELECT id, remaining_yearly FROM budgets
-                        WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0
-                        FOR UPDATE");
-    $s->execute([$owner_id, $code_id, $year]);
-    $y = $s->fetch(PDO::FETCH_ASSOC);
-    if (!$y) throw new Exception('No perdium budget allocated.');
-    $newRemY = (float)$y['remaining_yearly'] - $amount;
-    if ($newRemY < 0) throw new Exception('Insufficient remaining yearly budget for perdium.');
-    $pdo->prepare("UPDATE budgets SET remaining_yearly = ? WHERE id = ?")
-    ->execute([$newRemY, (int)$y['id']]);
+    
+    $newRem = (float)$b['remaining_monthly'] - $amount;
+    if ($newRem < 0) {
+        throw new Exception('Insufficient remaining monthly budget for perdium.');
+    }
+    
+    $pdo->prepare("UPDATE budgets SET remaining_monthly = ? WHERE id = ?")
+    ->execute([$newRem, (int)$b['id']]);
+    
     return [[
         'budget_type' => 'governmental',
-        'gov_budget_id' => (int)$y['id'],
+        'gov_budget_id' => (int)$b['id'],
         'prog_budget_id' => null,
         'amount' => $amount
     ]];
