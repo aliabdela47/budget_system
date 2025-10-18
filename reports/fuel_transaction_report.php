@@ -3,6 +3,9 @@
 require '../vendor/autoload.php';
 include '../includes/db.php';
 
+// Start session to get current user data
+session_start();
+
 use Andegna\DateTimeFactory;
 
 // Get transaction ID from URL
@@ -26,6 +29,19 @@ $stmt->execute([$transaction_id]);
 $transaction = $stmt->fetch(PDO::FETCH_ASSOC);
 if (!$transaction) {
     die("Transaction not found.");
+}
+
+// Get current logged in user's name
+$current_user_name = $_SESSION['username'] ?? 'Unknown User';
+
+// If we have user_id in session, try to get the actual name from database
+if (isset($_SESSION['user_id'])) {
+    $user_stmt = $pdo->prepare("SELECT name FROM users WHERE id = ?");
+    $user_stmt->execute([$_SESSION['user_id']]);
+    $user_data = $user_stmt->fetch(PDO::FETCH_ASSOC);
+    if ($user_data && !empty($user_data['name'])) {
+        $current_user_name = $user_data['name'];
+    }
 }
 
 // Convert transaction date to Ethiopian calendar
@@ -61,24 +77,27 @@ try {
             background-color: #f4f4f4;
             margin: 0;
             padding: 0;
-            font-size: 14px;
+            font-size: 14px; /* Increased from 12px to 14px (20% increase) */
         }
         .report-container {
             background-color: #fff;
-            padding: 10px 20px;
+            padding: 3mm 5mm; /* Reduced padding */
             width: 21cm;
-            min-height: 29.7cm;
+            height: 29.7cm;
             margin: 0 auto;
             box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
             box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
         }
 
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 5px 0;
+            padding: 1mm 0; /* Reduced padding */
             border-bottom: 2px solid #000;
+            flex-shrink: 0;
         }
 
         .header .flags-left, .header .flags-right {
@@ -86,7 +105,7 @@ try {
         }
         
         .header .flags-left img, .header .flags-right img {
-            height: 60px;
+            height: 35px; /* Reduced from 45px */
             width: auto;
         }
 
@@ -98,11 +117,11 @@ try {
             display: flex;
             flex-direction: column;
             align-items: flex-end;
-            font-size: 0.9em;
+            font-size: 0.8em; /* Increased from 0.75em */
         }
         
         .header .flags-right p {
-            margin: 2px 0;
+            margin: 1px 0;
         }
 
         .header-center {
@@ -114,38 +133,41 @@ try {
         }
         
         .header-center .logo img {
-            height: 90px;
+            height: 45px; /* Reduced from 60px */
             width: auto;
-            margin-bottom: 5px;
+            margin-bottom: 1px; /* Reduced margin */
         }
         
         .header-center .titles p {
             margin: 0;
             font-weight: bold;
+            font-size: 0.85em; /* Increased from 0.8em */
         }
 
         .report-title {
             text-align: center;
-            font-size: 1.2em;
+            font-size: 1.15em; /* Increased from 1.0em */
             font-weight: bold;
-            margin: 10px 0;
+            margin: 3mm 0; /* Reduced margin */
+            flex-shrink: 0;
         }
 
         .report-title p {
-            margin: 5px 0;
+            margin: 1px 0; /* Reduced margin */
         }
 
         .details-section {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
-            gap: 15px 30px;
-            margin: 15px 0;
+            gap: 5px 10px; /* Reduced gap */
+            margin: 5px 0; /* Reduced margin */
+            flex-shrink: 0;
         }
         
         .details-item {
             display: flex;
             align-items: baseline;
-            gap: 15px;
+            gap: 5px; /* Reduced gap */
         }
 
         .details-item label {
@@ -153,6 +175,7 @@ try {
             color: #444;
             white-space: nowrap;
             line-height: 1.2;
+            font-size: 0.9em; /* Increased from 0.85em */
         }
 
         .details-item span {
@@ -160,27 +183,32 @@ try {
             flex-grow: 1;
             padding: 0 2px;
             font-weight: bold;
+            font-size: 0.9em; /* Increased from 0.85em */
         }
 
         .table-container {
-            margin: 15px 0;
+            margin: 5px 0; /* Reduced margin */
+            flex: 1;
+            overflow: hidden;
         }
 
         .main-table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 1.0em;
+            font-size: 0.9em; /* Increased from 0.85em */
+            table-layout: fixed;
         }
 
         .main-table th, .main-table td {
             border: 1px solid #000;
-            padding: 8px;
+            padding: 3px; /* Reduced padding */
             text-align: center;
         }
         
         .main-table thead th {
             background-color: #f2f2f2;
             font-weight: bold;
+            font-size: 0.85em; /* Increased from 0.8em */
         }
 
         .main-table tbody td {
@@ -193,37 +221,66 @@ try {
         }
 
         .signature-section {
-            margin-top: 15px;
+            margin-top: 5px; /* Reduced margin */
+            flex-shrink: 0;
         }
 
         .signature-line {
             display: flex;
             justify-content: space-between;
             align-items: flex-end;
-            margin-top: 10px;
-            font-size: 0.95em;
+            margin-top: 4px; /* Reduced margin */
+            font-size: 0.9em; /* Increased from 0.85em */
         }
         
         .signature-line .label {
-            flex: 1;
             white-space: nowrap;
-            margin-right: 15px;
+            margin-right: 3px;
         }
         
         .signature-line .firma {
-            flex: 1;
             text-align: right;
-            padding-left: 20px;
+            padding-left: 8px; /* Reduced padding */
+        }
+
+        .signature-name {
+            display: inline-block;
+            border-bottom: 1px solid #000;
+            min-width: 100px; /* Reduced width */
+            padding: 0 2px; /* Reduced padding */
+            margin-left: 2px; /* Reduced margin */
+            text-align: center;
+            font-weight: bold;
+        }
+
+        .signature-combined {
+            display: flex;
+            align-items: baseline;
+            flex: 1;
         }
 
         .footer {
-            margin-top: 15px;
+            margin-top: 5px; /* Reduced margin */
             border-top: 2px solid #000;
-            padding-top: 10px;
+            padding-top: 4px; /* Reduced padding */
+            color: #555;
+            flex-shrink: 0;
+        }
+
+        .footer-top {
             display: flex;
             justify-content: space-between;
-            font-size: 0.8em;
-            color: #555;
+            margin-bottom: 3px; /* Reduced margin */
+            font-size: 1.08em; /* 20% increase from 0.9em */
+        }
+
+        .footer-bottom {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: bold;
+            margin-top: 2px; /* Reduced margin */
+            font-size: 1.08em; /* 20% increase from 0.9em */
         }
 
         @media print {
@@ -231,16 +288,21 @@ try {
                 -webkit-print-color-adjust: exact;
                 print-color-adjust: exact;
                 background-color: #fff;
+                margin: 0;
+                padding: 0;
             }
             .report-container {
                 box-shadow: none;
+                padding: 2mm 3mm; /* Reduced padding */
+                width: 100%;
+                height: 100%;
             }
             .no-print {
                 display: none;
             }
             @page {
                 size: A4 portrait;
-                margin: 0.5in;
+                margin: 2mm; /* Reduced margin */
             }
         }
     </style>
@@ -266,12 +328,11 @@ try {
                 <p><strong>Ayro:</strong> <?php echo $formattedTransactionDate; ?> ዓ.ም</p>
             </div>
         </header>
-
+<br>
         <section class="report-title">
             <p>Biiro Makaayinih Suktay Zeytiy Kee Gersi Gacamgac Uwwaytih damiyyi Essero Cibu</p>
             <p>የመስሪያ ቤታችን የተሽከርካሪ ቅባትና ዘይት የተለያዩ የመለዋወጫ እቃዎች ግዥ መጠየቂያ ቅጽ።</p>
-     <br>
-     </section>
+        </section>
 
         <section class="details-section">
             <div class="details-item">
@@ -288,40 +349,39 @@ try {
             </div>
             <div class="details-item">
                 <label>4. Kibbime Sansi:<br>የተሞላው የነዳጅ መጠን በሊትር</label>
-                <span><?php echo number_format($transaction['refuelable_amount'], 2); ?></span>
+                <span><?php echo number_format($transaction['refuelable_amount'] ?? 0, 2); ?></span>
             </div>
             <div class="details-item">
                 <label>5. Sansi Kibteway Suge Geej:<br>ነዳጅ ሲሞላ የነበረው የኪሎሜትር ንባብ</label>
-                <span><?php echo number_format($transaction['previous_gauge'], 2); ?> KM</span>
+                <span><?php echo number_format($transaction['previous_gauge'] ?? 0, 2); ?> KM</span>
             </div>
             <div class="details-item">
                 <label>6. Away yan Geej Lowwo:<br>አሁን ያለው የጌጅ ንባብ </label>
-                <span><?php echo number_format($transaction['current_gauge'], 2); ?> KM</span>
+                <span><?php echo number_format($transaction['current_gauge'] ?? 0, 2); ?> KM</span>
             </div>
             
              <div class="details-item">
                 <label>7. Geej Lowwo Baxsi:<br>የጌጅ ንባብ ልዩነት </label>
-                <span><?php echo number_format($transaction['gauge_gap'], 2); ?> KM</span>
+                <span><?php echo number_format($transaction['gauge_gap'] ?? 0, 2); ?> KM</span>
             </div>
             
             <div class="details-item">
                 <label>8. Duyyek Faxximtam:<br>የሚያስፈልገው የገንዘብ መጠን </label>
-                <span><?php echo number_format($transaction['total_amount'], 2); ?> ብር</span>
+                <span><?php echo number_format($transaction['total_amount'] ?? 0, 2); ?> ብር</span>
             </div>
-            <br>
         </section>
-
+<br>
         <div class="table-container">
             <table class="main-table">
                 <thead>
                     <tr>
-                        <th>K.L</th>
-                        <th>Uwwayti Qaynat<br>የእቃው አይነት</th>
-                        <th>Giyaase<br>መለኪያ</th>
-                        <th>Manga<br>ብዛት</th>
-                        <th>Inkitti Limo<br>የአንዱ ዋጋ</th>
-                        <th>Sittat<br>ጠቅ / ድምር</th>
-                        <th>Kusaq<br>ምርመራ</th>
+                        <th style="width: 5%">K.L</th>
+                        <th style="width: 25%">Uwwayti Qaynat<br>የእቃው አይነት</th>
+                        <th style="width: 10%">Giyaase<br>መለኪያ</th>
+                        <th style="width: 10%">Manga<br>ብዛት</th>
+                        <th style="width: 15%">Inkitti Limo<br>የአንዱ ዋጋ</th>
+                        <th style="width: 15%">Sittat<br>ጠቅ / ድምር</th>
+                        <th style="width: 10%">Kusaq<br>ምርመራ</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -329,9 +389,9 @@ try {
                         <td>1</td>
                         <td>Sansi/ ናፍታ</td>
                         <td>Liter/ ሊትር</td>
-                        <td><?php echo number_format($transaction['refuelable_amount'], 2); ?></td>
-                        <td><?php echo number_format($transaction['fuel_price'], 2); ?></td>
-                        <td><?php echo number_format($transaction['total_amount'], 2); ?></td>
+                        <td><?php echo number_format($transaction['refuelable_amount'] ?? 0, 2); ?></td>
+                        <td><?php echo number_format($transaction['fuel_price'] ?? 0, 2); ?></td>
+                        <td><?php echo number_format($transaction['total_amount'] ?? 0, 2); ?></td>
                         <td></td>
                     </tr>
                     <tr><td>2</td><td>Benzin/ ቤንዚን</td><td></td><td></td><td></td><td></td><td></td></tr>
@@ -345,38 +405,55 @@ try {
                     <tr><td>10</td><td>Kalat Tanim/ ሌሎች</td><td></td><td></td><td></td><td></td><td></td></tr>
                     <tr class="total-row">
                         <td colspan="5">Sittat (ድምር)</td>
-                        <td><?php echo number_format($transaction['total_amount'], 2); ?></td>
+                        <td><?php echo number_format($transaction['total_amount'] ?? 0, 2); ?></td>
                         <td></td>
                     </tr>
                 </tbody>
             </table>
         </div>
-        <br>
-
+<br>
         <section class="signature-section">
             <div class="signature-line">
-                <span class="label">Taama gexenum Migaaqa:__________________________</span>
+                <div class="signature-combined">
+                    <span class="label">Taama gexenum Migaaqa:</span>
+                    <span class="signature-name"><?php echo htmlspecialchars($transaction['driver_name']); ?></span>
+                </div>
                 <span class="firma">Firma: ___________________________</span>
             </div>
             <div class="signature-line">
-                <span class="label">Cisaab Massosee Migaaqa:_________________________</span>
+                <div class="signature-combined">
+                    <span class="label">Cisaab Massosee Migaaqa:</span>
+                    <span class="signature-name"><?php echo htmlspecialchars($current_user_name); ?></span>
+                </div>
                 <span class="firma">Firma: ___________________________</span>
             </div>
             <div class="signature-line">
-                <span class="label">Diggosse Migaaqa:_________________________________</span>
+                <div class="signature-combined">
+                    <span class="label">Diggosse Migaaqa:</span>
+                    <span class="signature-name">Abubeker Arba Oundie</span>
+                </div>
                 <span class="firma">Firma: ___________________________</span>
             </div>
             <div class="signature-line">
-                <span class="label">Faticisee Migaaqa:__________________________________</span>
+                <div class="signature-combined">
+                    <span class="label">Faticisee Migaaqa:</span>
+                    <span class="signature-name"></span>
+                </div>
                 <span class="firma">Firma: ___________________________</span>
             </div>
         </section>
 
         <footer class="footer">
-            <span>TEL: 033-666-00-22</span>
-            <span>Email: info@afarrhb.et</span>
-            <span>Printed on: <?php echo $formattedPrintDate; ?> ዓ.ም</span>
-            <span><b>Developed by: ICT Directorate</b></span>
+            <div class="footer-top">
+                <span>TEL: 033-666-00-22</span>
+                <span>Email: info@afarrhb.et</span>
+                <span>Printed on: <?php echo $formattedPrintDate; ?> ዓ.ም</span>
+                <span><b>Developed by: ICT Directorate</b></span>
+            </div>
+            <div class="footer-bottom">
+                <span>Printed by: <?php echo htmlspecialchars($current_user_name); ?></span>
+                <span>Date: <?php echo $formattedPrintDate; ?> ዓ.ም</span>
+            </div>
         </footer>
 
     </div>
