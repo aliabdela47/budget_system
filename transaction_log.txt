@@ -1,0 +1,42 @@
+2025-08-12 23:20:22 - Starting transaction: owner_id=10, code_id=5, amount=250
+2025-08-12 23:20:22 - Updated monthly budget: new_amount=2750
+2025-08-12 23:20:22 - Updated yearly budget: new_amount=65350
+2025-08-12 23:20:22 - Inserted new transaction
+2025-08-12 23:27:09 - Starting transaction: owner_id=8, code_id=7, amount=33000
+2025-08-12 23:27:09 - Updated monthly budget: new_amount=17000
+2025-08-12 23:27:09 - Updated yearly budget: new_amount=77000
+2025-08-12 23:27:09 - Inserted new transaction
+2025-08-12 23:31:29 - Starting transaction: owner_id=10, code_id=7, amount=3500
+2025-08-12 23:31:29 - Updated yearly budget: new_amount=45000
+2025-08-12 23:31:29 - Inserted new transaction
+2025-08-12 23:33:15 - Starting transaction: owner_id=10, code_id=7, amount=500
+2025-08-12 23:33:15 - Updated yearly budget: new_amount=44500
+2025-08-12 23:33:15 - Inserted new transaction
+2025-08-12 23:40:01 - Starting transaction: owner_id=10, code_id=7, amount=10000
+2025-08-12 23:40:01 - Updated monthly budget: new_amount=15000
+2025-08-12 23:40:01 - Updated yearly budget: new_amount=190000
+2025-08-12 23:40:01 - Inserted new transaction
+2025-08-12 23:44:02 - Starting transaction: owner_id=10, code_id=7, amount=5000
+2025-08-12 23:44:02 - Updated monthly budget: new_amount=10000
+2025-08-12 23:44:02 - Updated yearly budget: new_amount=185000
+2025-08-12 23:44:02 - Inserted new transaction
+2025-08-12 23:55:42 - Starting transaction: owner_id=10, code_id=6, amount=1000
+2025-08-12 23:55:42 - Updated monthly budget: new_amount=34000
+2025-08-12 23:55:42 - Updated yearly budget: new_amount=299000
+2025-08-12 23:55:42 - Inserted new transaction
+2025-08-12 23:59:47 - Starting transaction: owner_id=10, code_id=6, amount=4000
+2025-08-12 23:59:47 - Updated monthly budget: new_amount=30000
+2025-08-12 23:59:47 - Updated yearly budget: new_amount=295000
+2025-08-12 23:59:47 - Inserted new transaction
+2025-08-13 00:06:21 - Starting transaction: owner_id=10, code_id=6, amount=5000
+2025-08-13 00:06:21 - Updated monthly budget: new_amount=25000
+2025-08-13 00:06:21 - Updated yearly budget: new_amount=290000
+2025-08-13 00:06:21 - Inserted new transaction
+2025-08-13 00:09:27 - Starting transaction: owner_id=10, code_id=6, amount=10000
+2025-08-13 00:09:27 - Updated monthly budget: new_amount=15000
+2025-08-13 00:09:27 - Updated yearly budget: new_amount=280000
+2025-08-13 00:09:27 - Inserted new transaction
+2025-08-13 00:16:23 - Starting transaction: owner_id=10, code_id=5, amount=3000
+2025-08-13 00:16:23 - Updated monthly budget: new_amount=42000
+2025-08-13 00:16:23 - Updated yearly budget: new_amount=397000
+2025-08-13 00:16:23 - Inserted new transaction

@@ -1,0 +1,1371 @@
+<?php
+require_once 'includes/init.php';
+
+// Ensure CSRF token exists
+if (empty($_SESSION['csrf'])) {
+    $_SESSION['csrf'] = bin2hex(random_bytes(32));
+}
+function csrf_check($t) { return hash_equals($_SESSION['csrf'] ?? '', $t ?? ''); }
+
+// Role flags
+$is_admin   = (($_SESSION['role'] ?? '') === 'admin');
+$is_officer = (($_SESSION['role'] ?? '') === 'officer');
+
+// Helpers
+function ecYear(): int { return (int)date('Y') - 8; } // Consider a proper EC library for accuracy
+function monthsEC(): array {
+    return ['መስከረም','ጥቅምት','ህዳር','ታኅሳስ','ጥር','የካቲት','መጋቢት','ሚያዝያ','ግንቦት','ሰኔ','ሐምሌ','ነሐሴ'];
+}
+function calcPerdiem(float $rate, int $days): float {
+    $days = max(1, $days);
+    $A = $rate * (0.1 + 0.25 + 0.25);
+    $mid = max(0, $days - 2);
+    $C = $rate * (0.1 + 0.25);
+    $nights = max(0, $days - 1);
+    return $A + ($A * $mid) + $C + ($rate * 0.4 * $nights);
+}
+
+// Existence checks
+function ownerExists(PDO $pdo, string $type, int $owner_id): bool {
+    if ($type === 'program') {
+        $s = $pdo->prepare("SELECT id FROM p_budget_owners WHERE id = ?");
+        $s->execute([$owner_id]);
+        return (bool)$s->fetchColumn();
+    } else {
+        $s = $pdo->prepare("SELECT id FROM budget_owners WHERE id = ?");
+        $s->execute([$owner_id]);
+        return (bool)$s->fetchColumn();
+    }
+}
+function employeeExists(PDO $pdo, int $employee_id): bool {
+    $s = $pdo->prepare("SELECT id FROM emp_list WHERE id = ?");
+    $s->execute([$employee_id]);
+    return (bool)$s->fetchColumn();
+}
+function cityExists(PDO $pdo, int $city_id): bool {
+    $s = $pdo->prepare("SELECT id FROM cities WHERE id = ?");
+    $s->execute([$city_id]);
+    return (bool)$s->fetchColumn();
+}
+
+// Overlap + active checks (server-side)
+function hasOverlap(PDO $pdo, int $employee_id, string $dep, string $arr, ?int $exclude_id = null): bool {
+    $sql = "SELECT COUNT(*) FROM perdium_transactions
+            WHERE employee_id = ?
+              AND NOT (arrival_date < ? OR departure_date > ?)";
+    $params = [$employee_id, $dep, $arr];
+    if ($exclude_id) { $sql .= " AND id <> ?"; $params[] = $exclude_id; }
+    $s = $pdo->prepare($sql);
+    $s->execute($params);
+    return ((int)$s->fetchColumn()) > 0;
+}
+function isEmployeeActive(PDO $pdo, int $employee_id, ?int $exclude_id = null): bool {
+    $sql = "SELECT COUNT(*) FROM perdium_transactions
+            WHERE employee_id = ?
+              AND CURDATE() BETWEEN departure_date AND arrival_date";
+    $params = [$employee_id];
+    if ($exclude_id) { $sql .= " AND id <> ?"; $params[] = $exclude_id; }
+    $s = $pdo->prepare($sql);
+    $s->execute($params);
+    return ((int)$s->fetchColumn()) > 0;
+}
+
+// Reverse allocations from ledger
+function reverseAllocations(PDO $pdo, int $perdium_id): int {
+    $sel = $pdo->prepare("SELECT * FROM perdium_budget_allocations WHERE perdium_id = ?");
+    $sel->execute([$perdium_id]);
+    $rows = $sel->fetchAll(PDO::FETCH_ASSOC);
+    $count = 0;
+
+    foreach ($rows as $al) {
+        $amount = (float)$al['amount'];
+        if ($al['budget_type'] === 'governmental' && $al['gov_budget_id']) {
+            $r = $pdo->prepare("SELECT id, monthly_amount FROM budgets WHERE id = ? FOR UPDATE");
+            $r->execute([(int)$al['gov_budget_id']]);
+            $b = $r->fetch(PDO::FETCH_ASSOC);
+            if ($b) {
+                if ((float)$b['monthly_amount'] > 0) {
+                    $pdo->prepare("UPDATE budgets SET remaining_monthly = remaining_monthly + ? WHERE id = ?")
+                        ->execute([$amount, (int)$b['id']]);
+                } else {
+                    $pdo->prepare("UPDATE budgets SET remaining_yearly = remaining_yearly + ? WHERE id = ?")
+                        ->execute([$amount, (int)$b['id']]);
+                }
+                $count++;
+            }
+        } elseif ($al['budget_type'] === 'program' && $al['prog_budget_id']) {
+            $r = $pdo->prepare("SELECT id FROM p_budgets WHERE id = ? FOR UPDATE");
+            $r->execute([(int)$al['prog_budget_id']]);
+            if ($r->fetch(PDO::FETCH_ASSOC)) {
+                $pdo->prepare("UPDATE p_budgets SET remaining_yearly = remaining_yearly + ? WHERE id = ?")
+                    ->execute([$amount, (int)$al['prog_budget_id']]);
+                $count++;
+            }
+        }
+    }
+    if ($count > 0) {
+        $pdo->prepare("DELETE FROM perdium_budget_allocations WHERE perdium_id = ?")->execute([$perdium_id]);
+    }
+    return $count;
+}
+
+// Legacy fallback reversal (for old rows without ledger)
+function reverseLegacy(PDO $pdo, array $tx): void {
+    $amount = (float)$tx['total_amount'];
+    $year = (int)($tx['year'] ?? (date('Y') - 8));
+    $owner_id = (int)$tx['budget_owner_id'];
+    $code_id = (int)($tx['budget_code_id'] ?: 6);
+
+    if ($tx['budget_type'] === 'program') {
+        $r = $pdo->prepare("SELECT id FROM p_budgets WHERE owner_id = ? AND year = ? FOR UPDATE");
+        $r->execute([$owner_id, $year]);
+        $row = $r->fetch(PDO::FETCH_ASSOC);
+        if ($row) {
+            $pdo->prepare("UPDATE p_budgets SET remaining_yearly = remaining_yearly + ? WHERE id = ?")
+                ->execute([$amount, (int)$row['id']]);
+            return;
+        }
+        $r = $pdo->prepare("SELECT id FROM budgets WHERE budget_type='program' AND owner_id = ? AND year = ? AND monthly_amount = 0 FOR UPDATE");
+        $r->execute([$owner_id, $year]);
+        $b = $r->fetch(PDO::FETCH_ASSOC);
+        if ($b) {
+            $pdo->prepare("UPDATE budgets SET remaining_yearly = remaining_yearly + ? WHERE id = ?")
+                ->execute([$amount, (int)$b['id']]);
+        }
+    } else {
+        $month = $tx['et_month'];
+        if (!empty($month)) {
+            $r = $pdo->prepare("SELECT id FROM budgets WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND month = ? FOR UPDATE");
+            $r->execute([$owner_id, $code_id, $year, $month]);
+            $b = $r->fetch(PDO::FETCH_ASSOC);
+            if ($b) {
+                $pdo->prepare("UPDATE budgets SET remaining_monthly = remaining_monthly + ? WHERE id = ?")
+                    ->execute([$amount, (int)$b['id']]);
+                return;
+            }
+        }
+        $r = $pdo->prepare("SELECT id FROM budgets WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0 FOR UPDATE");
+        $r->execute([$owner_id, $code_id, $year]);
+        $b = $r->fetch(PDO::FETCH_ASSOC);
+        if ($b) {
+            $pdo->prepare("UPDATE budgets SET remaining_yearly = remaining_yearly + ? WHERE id = ?")
+                ->execute([$amount, (int)$b['id']]);
+        }
+    }
+}
+
+// Allocation helpers
+function allocateProgram(PDO $pdo, int $owner_id, int $year, float $amount): array {
+    $s = $pdo->prepare("SELECT id, remaining_yearly FROM p_budgets WHERE owner_id = ? AND year = ? FOR UPDATE");
+    $s->execute([$owner_id, $year]);
+    $row = $s->fetch(PDO::FETCH_ASSOC);
+    if (!$row) throw new Exception('No program budget allocated for this owner/year.');
+    $newRem = (float)$row['remaining_yearly'] - $amount;
+    if ($newRem < 0) throw new Exception('Insufficient program yearly budget.');
+    $pdo->prepare("UPDATE p_budgets SET remaining_yearly = ? WHERE id = ?")
+        ->execute([$newRem, (int)$row['id']]);
+    return [['budget_type' => 'program', 'prog_budget_id' => (int)$row['id'], 'gov_budget_id' => null, 'amount' => $amount]];
+}
+function allocateGovernment(PDO $pdo, int $owner_id, int $year, string $et_month, float $amount, int $code_id = 6): array {
+    // Monthly first
+    $s = $pdo->prepare("SELECT id, remaining_monthly FROM budgets
+                        WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND month = ?
+                        FOR UPDATE");
+    $s->execute([$owner_id, $code_id, $year, $et_month]);
+    $b = $s->fetch(PDO::FETCH_ASSOC);
+    if ($b) {
+        $newRem = (float)$b['remaining_monthly'] - $amount;
+        if ($newRem < 0) throw new Exception('Insufficient remaining monthly budget for per diem.');
+        $pdo->prepare("UPDATE budgets SET remaining_monthly = ? WHERE id = ?")
+            ->execute([$newRem, (int)$b['id']]);
+        return [['budget_type' => 'governmental', 'gov_budget_id' => (int)$b['id'], 'prog_budget_id' => null, 'amount' => $amount]];
+    }
+    // Yearly fallback
+    $s = $pdo->prepare("SELECT id, remaining_yearly FROM budgets
+                        WHERE budget_type='governmental' AND owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0
+                        FOR UPDATE");
+    $s->execute([$owner_id, $code_id, $year]);
+    $y = $s->fetch(PDO::FETCH_ASSOC);
+    if (!$y) throw new Exception('No per diem budget allocated.');
+    $newRemY = (float)$y['remaining_yearly'] - $amount;
+    if ($newRemY < 0) throw new Exception('Insufficient remaining yearly budget for per diem.');
+    $pdo->prepare("UPDATE budgets SET remaining_yearly = ? WHERE id = ?")
+        ->execute([$newRemY, (int)$y['id']]);
+    return [['budget_type' => 'governmental', 'gov_budget_id' => (int)$y['id'], 'prog_budget_id' => null, 'amount' => $amount]];
+}
+function insertAllocations(PDO $pdo, int $perdium_id, array $allocs): void {
+    $ins = $pdo->prepare("INSERT INTO perdium_budget_allocations (perdium_id, budget_type, gov_budget_id, prog_budget_id, amount)
+                          VALUES (?, ?, ?, ?, ?)");
+    foreach ($allocs as $a) {
+        $ins->execute([$perdium_id, $a['budget_type'], $a['gov_budget_id'] ?? null, $a['prog_budget_id'] ?? null, $a['amount']]);
+    }
+}
+
+// Get user name
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) { header('Location: login.php'); exit; }
+$stmt = $pdo->prepare("SELECT name FROM users WHERE id = ?");
+$stmt->execute([$user_id]);
+$user_data = $stmt->fetch(PDO::FETCH_ASSOC);
+$user_name = $user_data['name'] ?? ($_SESSION['username'] ?? 'User');
+
+// Data for selects
+$gov_owners  = $pdo->query("SELECT * FROM budget_owners ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
+$prog_owners = $pdo->query("SELECT * FROM p_budget_owners ORDER BY code")->fetchAll(PDO::FETCH_ASSOC);
+$employees   = $pdo->query("SELECT * FROM emp_list ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+$cities      = $pdo->query("SELECT * FROM cities ORDER BY name_english")->fetchAll(PDO::FETCH_ASSOC);
+$months      = monthsEC();
+
+// Edit mode
+$perdium = null;
+if (isset($_GET['action'], $_GET['id']) && $_GET['action'] === 'edit') {
+    if (!$is_admin) { http_response_code(403); exit('Forbidden'); }
+    $stmt = $pdo->prepare("SELECT * FROM perdium_transactions WHERE id = ?");
+    $stmt->execute([(int)$_GET['id']]);
+    $perdium = $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+// Flash helpers
+function set_flash($msg, $type='info'){ $_SESSION['message']=$msg; $_SESSION['message_type']=$type; }
+
+// Handle POST
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    // DELETE via POST (admin only)
+    if ($action === 'delete') {
+        if (!$is_admin) { http_response_code(403); exit('Forbidden'); }
+        if (!csrf_check($_POST['csrf'] ?? '')) { http_response_code(400); exit('Bad CSRF'); }
+        $del_id = (int)($_POST['id'] ?? 0);
+        if ($del_id <= 0) { set_flash('Invalid delete request', 'error'); header('Location: perdium.php'); exit; }
+
+        try {
+            $pdo->beginTransaction();
+            $s = $pdo->prepare("SELECT *, YEAR(created_at) AS year FROM perdium_transactions WHERE id = ? FOR UPDATE");
+            $s->execute([$del_id]);
+            $tx = $s->fetch(PDO::FETCH_ASSOC);
+            if ($tx) {
+                $revCount = reverseAllocations($pdo, $del_id);
+                if ($revCount === 0) {
+                    $tx['year'] = $tx['year'] ?: ecYear();
+                    $tx['budget_code_id'] = $tx['budget_code_id'] ?: 6;
+                    reverseLegacy($pdo, $tx);
+                }
+            }
+            $pdo->prepare("DELETE FROM perdium_transactions WHERE id = ?")->execute([$del_id]);
+            $pdo->commit();
+            set_flash('Per diem transaction deleted', 'success');
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            set_flash('Error: ' . $e->getMessage(), 'error');
+        }
+        header('Location: perdium.php'); exit;
+    }
+
+    // ADD/UPDATE
+    if (!in_array($_SESSION['role'] ?? '', ['admin','officer'], true)) {
+        http_response_code(403); exit('Forbidden');
+    }
+    if (!csrf_check($_POST['csrf'] ?? '')) { http_response_code(400); exit('Bad CSRF'); }
+
+    $id           = isset($_POST['id']) ? (int)$_POST['id'] : null;
+    $is_update    = (($action === 'update') && $id);
+    if ($is_update && !$is_admin) { http_response_code(403); exit('Forbidden'); }
+
+    $budget_type  = (($_POST['budget_type'] ?? 'governmental') === 'program') ? 'program' : 'governmental';
+    $employee_id  = (int)($_POST['employee_id'] ?? 0);
+    $owner_id     = (int)($_POST['owner_id'] ?? 0);
+    $city_id      = (int)($_POST['city_id'] ?? 0);
+    $perdium_rate = (float)($_POST['perdium_rate'] ?? 0);
+    $total_days   = (int)($_POST['total_days'] ?? 0);
+    $departure_date = trim($_POST['departure_date'] ?? '');
+    $arrival_date   = trim($_POST['arrival_date'] ?? '');
+    $et_month     = $budget_type === 'program' ? '' : trim($_POST['et_month'] ?? '');
+
+    // Validate
+    if ($employee_id <= 0 || !employeeExists($pdo, $employee_id)) { set_flash('Invalid employee', 'error'); }
+    elseif ($owner_id <= 0 || !ownerExists($pdo, $budget_type, $owner_id)) { set_flash('Invalid budget owner', 'error'); }
+    elseif ($city_id <= 0 || !cityExists($pdo, $city_id)) { set_flash('Invalid city', 'error'); }
+    elseif ($perdium_rate <= 0) { set_flash('Per diem rate must be > 0', 'error'); }
+    elseif ($total_days < 1) { set_flash('Total days must be at least 1', 'error'); }
+    elseif (!$departure_date || !$arrival_date) { set_flash('Departure and arrival dates are required', 'error'); }
+    elseif (strtotime($arrival_date) < strtotime($departure_date)) { set_flash('Arrival date cannot be before departure date', 'error'); }
+    elseif ($budget_type === 'governmental' && $et_month !== '' && !in_array($et_month, monthsEC(), true)) { set_flash('Invalid Ethiopian month', 'error'); }
+    else {
+        if (isEmployeeActive($pdo, $employee_id, $is_update ? $id : null)) {
+            set_flash('This employee is currently on a per diem; you can create a new one only after the current end date.', 'error');
+        } elseif (hasOverlap($pdo, $employee_id, $departure_date, $arrival_date, $is_update ? $id : null)) {
+            set_flash('Selected dates overlap with another per diem for this employee.', 'error');
+        } else {
+            try {
+                $pdo->beginTransaction();
+
+                $year = ecYear();
+                $code_id = 6; // Per diem budget code
+                $total_amount = calcPerdiem($perdium_rate, $total_days);
+
+                // Governmental p_koox only
+                $p_koox = null;
+                if ($budget_type === 'governmental') {
+                    $st = $pdo->prepare("SELECT p_koox FROM budget_owners WHERE id = ?");
+                    $st->execute([$owner_id]);
+                    $row = $st->fetch(PDO::FETCH_ASSOC);
+                    $p_koox = $row['p_koox'] ?? null;
+                }
+
+                // Reverse old allocations if updating
+                if ($is_update) {
+                    $old = $pdo->prepare("SELECT *, YEAR(created_at) AS year FROM perdium_transactions WHERE id = ? FOR UPDATE");
+                    $old->execute([$id]);
+                    $oldTx = $old->fetch(PDO::FETCH_ASSOC);
+                    if (!$oldTx) throw new Exception('Transaction not found for update.');
+
+                    $revCount = reverseAllocations($pdo, $id);
+                    if ($revCount === 0) {
+                        $oldTx['year'] = $oldTx['year'] ?: $year;
+                        $oldTx['budget_code_id'] = $oldTx['budget_code_id'] ?: $code_id;
+                        reverseLegacy($pdo, $oldTx);
+                    }
+                }
+
+                // Allocate and persist
+                if ($budget_type === 'program') {
+                    $allocs = allocateProgram($pdo, $owner_id, $year, $total_amount);
+
+                    if ($is_update) {
+                        $u = $pdo->prepare("
+                            UPDATE perdium_transactions
+                            SET budget_type='program',
+                                employee_id=?, budget_owner_id=?, p_koox=?, budget_code_id=?, city_id=?,
+                                perdium_rate=?, total_days=?, departure_date=?, arrival_date=?, total_amount=?, et_month=?
+                            WHERE id=?
+                        ");
+                        $u->execute([
+                            $employee_id, $owner_id, null, $code_id, $city_id,
+                            $perdium_rate, $total_days, $departure_date, $arrival_date, $total_amount, '', $id
+                        ]);
+                        $perdium_id = $id;
+                    } else {
+                        $ins = $pdo->prepare("
+                            INSERT INTO perdium_transactions (
+                                budget_type, employee_id, budget_owner_id, p_koox, budget_code_id, city_id,
+                                perdium_rate, total_days, departure_date, arrival_date, total_amount, et_month
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ");
+                        $ins->execute([
+                            'program', $employee_id, $owner_id, null, $code_id, $city_id,
+                            $perdium_rate, $total_days, $departure_date, $arrival_date, $total_amount, ''
+                        ]);
+                        $perdium_id = (int)$pdo->lastInsertId();
+                    }
+
+                    insertAllocations($pdo, $perdium_id, $allocs);
+                    set_flash($is_update ? 'Program per diem transaction updated' : 'Program per diem transaction added', 'success');
+
+                } else {
+                    if ($et_month === '') throw new Exception('Ethiopian month is required for governmental budget.');
+
+                    $allocs = allocateGovernment($pdo, $owner_id, $year, $et_month, $total_amount, $code_id);
+
+                    if ($is_update) {
+                        $u = $pdo->prepare("
+                            UPDATE perdium_transactions
+                            SET budget_type='governmental',
+                                employee_id=?, budget_owner_id=?, p_koox=?, budget_code_id=?, city_id=?,
+                                perdium_rate=?, total_days=?, departure_date=?, arrival_date=?, total_amount=?, et_month=?
+                            WHERE id=?
+                        ");
+                        $u->execute([
+                            $employee_id, $owner_id, $p_koox, $code_id, $city_id,
+                            $perdium_rate, $total_days, $departure_date, $arrival_date, $total_amount, $et_month, $id
+                        ]);
+                        $perdium_id = $id;
+                    } else {
+                        $ins = $pdo->prepare("
+                            INSERT INTO perdium_transactions (
+                                budget_type, employee_id, budget_owner_id, p_koox, budget_code_id, city_id,
+                                perdium_rate, total_days, departure_date, arrival_date, total_amount, et_month
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ");
+                        $ins->execute([
+                            'governmental', $employee_id, $owner_id, $p_koox, $code_id, $city_id,
+                            $perdium_rate, $total_days, $departure_date, $arrival_date, $total_amount, $et_month
+                        ]);
+                        $perdium_id = (int)$pdo->lastInsertId();
+                    }
+
+                    insertAllocations($pdo, $perdium_id, $allocs);
+                    set_flash($is_update ? 'Per diem transaction updated' : 'Per diem transaction added', 'success');
+                }
+
+                $pdo->commit();
+                header('Location: perdium.php'); exit;
+
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                set_flash('Error: ' . $e->getMessage(), 'error');
+            }
+        }
+    }
+}
+
+// Flash
+$message = $_SESSION['message'] ?? null;
+$message_type = $_SESSION['message_type'] ?? 'info';
+unset($_SESSION['message'], $_SESSION['message_type']);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Per Diem Management - Budget System</title>
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <link href="../assets/css/materialize.css" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="css/sidebar.css">
+  <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Ethiopic:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    .ethio-font { font-family: 'Noto Sans Ethiopic', sans-serif; }
+    .fade-out{opacity:1;transition:opacity .5s ease-out}.fade-out.hide{opacity:0}
+    .main-content { width: 100%; }
+    .select2-container--default .select2-selection--single{height:42px;border:1px solid #d1d5db;border-radius:.375rem}
+    .select2-container--default .select2-selection--single .select2-selection__rendered{line-height:40px;padding-left:12px}
+    .select2-container--default .select2-selection--single .select2-selection__arrow{height:40px}
+    .select2-container--default .select2-results__option--highlighted[aria-selected]{background-color:#4f46e5}
+    .info-card{background:linear-gradient(135deg,#f0f9ff 0%,#e0f2fe 100%);border-left:4px solid #3b82f6}
+    .program-card{background:linear-gradient(135deg,#f0f4ff 0%,#e0e7ff 100%);border-left:4px solid #6366f1}
+    .employee-card{background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);border-left:4px solid #22c55e}
+    .row-click { cursor:pointer; }
+    .hidden { display: none; }
+    .input-locked { opacity: 0.65; }
+  </style>
+</head>
+<body class="text-slate-700 flex bg-gray-100 min-h-screen">
+  <?php require_once 'includes/sidebar.php'; ?>
+  <div class="main-content" id="mainContent">
+    <div class="p-6">
+      <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 p-6 bg-white rounded-xl shadow-sm">
+        <div>
+          <h1 class="text-2xl md:text-3xl font-bold text-slate-800">Per Diem Management</h1>
+          <p class="text-slate-600 mt-2">Manage per diem transactions and expenses</p>
+          <div class="mt-3 bg-indigo-100 rounded-lg p-3 max-w-md info-card">
+            <i class="fas fa-user-circle text-indigo-600 mr-2"></i>
+            <span class="text-indigo-800 font-semibold">
+              Welcome, <?php echo htmlspecialchars($user_name); ?>! (<?php echo htmlspecialchars(ucfirst($_SESSION['role'] ?? '')); ?>)
+            </span>
+          </div>
+        </div>
+        <div class="flex items-center space-x-4 mt-4 md:mt-0">
+          <button class="bg-slate-200 hover:bg-slate-300 text-slate-700 p-2 rounded-lg md:hidden shadow-sm" id="sidebarToggle">
+            <i class="fas fa-bars"></i>
+          </button>
+        </div>
+      </div>
+
+      <?php if ($message): ?>
+        <div id="message" class="fade-out mb-6 p-4 rounded-lg <?php
+          echo $message_type == 'error' ? 'bg-red-100 text-red-700' :
+          ($message_type == 'success' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700');
+        ?>">
+          <div class="flex justify-between items-center">
+            <p><?php echo htmlspecialchars($message); ?></p>
+            <button onclick="document.getElementById('message').classList.add('hide')" class="text-lg">&times;</button>
+          </div>
+        </div>
+        <script>setTimeout(()=>{const m=document.getElementById('message');if(m){m.classList.add('hide');setTimeout(()=>m.remove(),500);}},5000);</script>
+      <?php endif; ?>
+
+      <div class="bg-white rounded-xl p-6 shadow-sm mb-8">
+        <h2 class="text-xl font-bold text-slate-800 mb-6"><?php echo isset($perdium) ? 'Edit Per Diem Transaction' : 'Add New Per Diem Transaction'; ?></h2>
+        <form id="perdiumForm" method="POST" class="space-y-4" onsubmit="return validateBeforeSubmit();">
+          <?php if (isset($perdium)): ?>
+            <input type="hidden" name="id" value="<?php echo (int)$perdium['id']; ?>">
+            <input type="hidden" name="action" value="update">
+          <?php endif; ?>
+          <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['csrf']); ?>">
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Budget Source Type *</label>
+              <select name="budget_type" id="budget_type" class="w-full select2">
+                <option value="governmental" <?php echo isset($perdium) ? ($perdium['budget_type']==='governmental' ? 'selected' : '') : 'selected'; ?>>Government Budget</option>
+                <option value="program" <?php echo isset($perdium) && $perdium['budget_type']==='program' ? 'selected' : ''; ?>>Programs Budget</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Budget Owner *</label>
+              <select name="owner_id" id="owner_id" required class="w-full select2">
+                <option value="">Select a Budget Source First</option>
+              </select>
+            </div>
+
+            <div class="program-card p-4 rounded-lg">
+              <h3 class="text-sm font-medium text-indigo-800 mb-2">Source Details</h3>
+              <div class="flex items-center">
+                <div class="w-10 h-10 bg-indigo-100 rounded-full flex items-center justify-center mr-3">
+                  <i class="fas fa-project-diagram text-indigo-600"></i>
+                </div>
+                <div>
+                  <p id="owner_name_display" class="text-sm font-medium text-gray-900">-</p>
+                  <p id="p_koox_row" class="text-xs text-gray-600" style="display:none;">
+                    P/Koox: <span id="p_koox_display">-</span>
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Employee *</label>
+              <select name="employee_id" id="employee_id" required class="w-full select2">
+                <option value="">Select Employee</option>
+                <?php foreach ($employees as $e): ?>
+                  <option value="<?php echo (int)$e['id']; ?>"
+                    data-salary="<?php echo htmlspecialchars($e['salary']); ?>"
+                    data-position="<?php echo htmlspecialchars($e['taamagoli'] ?? ''); ?>"
+                    data-department="<?php echo htmlspecialchars($e['directorate'] ?? ''); ?>"
+                    <?php
+                    $sel = false;
+                    if (isset($perdium) && $perdium['employee_id'] == $e['id']) $sel = true;
+                    if (isset($_POST['employee_id']) && $_POST['employee_id'] == $e['id']) $sel = true;
+                    echo $sel ? 'selected' : '';
+                    ?>>
+                    <?php echo htmlspecialchars(($e['name'] ?? $e['name_am'] ?? '') . ' - ' . ($e['taamagoli'] ?? '')); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Destination City *</label>
+              <select name="city_id" id="city_id" required class="w-full select2">
+                <option value="">Select City</option>
+                <?php foreach ($cities as $c): ?>
+                  <option value="<?php echo (int)$c['id']; ?>"
+                    data-rate-low="<?php echo htmlspecialchars($c['rate_low']); ?>"
+                    data-rate-medium="<?php echo htmlspecialchars($c['rate_medium']); ?>"
+                    data-rate-high="<?php echo htmlspecialchars($c['rate_high']); ?>"
+                    <?php
+                    $sel = false;
+                    if (isset($perdium) && $perdium['city_id'] == $c['id']) $sel = true;
+                    if (isset($_POST['city_id']) && $_POST['city_id'] == $c['id']) $sel = true;
+                    echo $sel ? 'selected' : '';
+                    ?>>
+                    <?php echo htmlspecialchars($c['name_amharic']); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div id="et_month_box">
+              <label class="block text-sm font-medium text-slate-700 mb-1">Ethiopian Month *</label>
+              <select name="et_month" id="et_month" required class="w-full select2">
+                <option value="">Select Month</option>
+                <?php foreach ($months as $m): ?>
+                  <option value="<?php echo htmlspecialchars($m); ?>"
+                    <?php
+                      $sel = false;
+                      if (isset($perdium) && $perdium['et_month'] == $m && $perdium['budget_type']!=='program') $sel = true;
+                      if (isset($_POST['et_month']) && $_POST['et_month'] == $m) $sel = true;
+                      echo $sel ? 'selected' : '';
+                    ?>>
+                    <?php echo htmlspecialchars($m); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+          </div>
+
+          <div id="employeeActiveWarning" class="mb-4 p-3 rounded-md bg-yellow-100 text-yellow-800 hidden">
+            <i class="fas fa-exclamation-triangle mr-2"></i>
+            Employee is currently on a per diem until <span id="block_until_date"></span>. You cannot create another per diem until after this date.
+          </div>
+          <div id="employeeOverlapWarning" class="mb-4 p-3 rounded-md bg-red-100 text-red-800 hidden">
+            <i class="fas fa-ban mr-2"></i>
+            Selected dates overlap with another per diem for this employee.
+          </div>
+
+          <div class="employee-card p-4 rounded-lg">
+            <h3 class="text-sm font-medium text-green-800 mb-2">Employee Details</h3>
+            <div class="flex items-center">
+              <div class="w-10 h-10 bg-green-100 rounded-full flex items-center justify-center mr-3">
+                <i class="fas fa-user-tie text-green-600"></i>
+              </div>
+              <div>
+                <p id="employee_position_display" class="text-sm font-medium text-gray-900">-</p>
+                <p id="employee_department_display" class="text-xs text-gray-600">Department: -</p>
+                <p id="employee_salary_display" class="text-xs text-gray-600">Salary: -</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Departure Date *</label>
+              <input type="date" name="departure_date" id="departure_date" value="<?php
+                echo isset($perdium) ? htmlspecialchars($perdium['departure_date']) : (isset($_POST['departure_date']) ? htmlspecialchars($_POST['departure_date']) : '');
+              ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Arrival Date *</label>
+              <input type="date" name="arrival_date" id="arrival_date" value="<?php
+                echo isset($perdium) ? htmlspecialchars($perdium['arrival_date']) : (isset($_POST['arrival_date']) ? htmlspecialchars($_POST['arrival_date']) : '');
+              ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Total Per Diem Days *</label>
+              <input type="number" name="total_days" id="total_days" value="<?php
+                echo isset($perdium) ? (int)$perdium['total_days'] : (isset($_POST['total_days']) ? (int)$_POST['total_days'] : '');
+              ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" oninput="updateDates()">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Per Diem Rate (per day) *</label>
+              <input type="number" step="0.01" name="perdium_rate" id="perdium_rate" value="<?php
+                echo isset($perdium) ? htmlspecialchars($perdium['perdium_rate']) : (isset($_POST['perdium_rate']) ? htmlspecialchars($_POST['perdium_rate']) : '100');
+              ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" oninput="calculatePerdium()">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="rounded-xl p-4 bg-gradient-to-r from-sky-100 to-sky-50 border border-sky-200 shadow-sm">
+              <div class="text-sm text-sky-700 font-medium">Total Days</div>
+              <div id="total_days_card" class="text-2xl font-extrabold text-sky-900 mt-1">0</div>
+            </div>
+            <div class="rounded-xl p-4 bg-gradient-to-r from-amber-100 to-amber-50 border border-amber-200 shadow-sm">
+              <div class="text-sm text-amber-700 font-medium">Total Amount</div>
+              <div id="total_amount_card" class="text-2xl font-extrabold text-amber-900 mt-1">0.00 ብር</div>
+              <input type="hidden" name="total_amount" id="total_amount" value="0">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div id="rem_monthly_card" class="rounded-xl p-5 bg-gradient-to-r from-amber-100 to-amber-50 border border-amber-200 shadow-sm">
+              <div class="flex items-center gap-3">
+                <div class="p-3 rounded-full bg-amber-200 text-amber-800"><i class="fas fa-calendar-alt"></i></div>
+                <div>
+                  <div class="text-sm text-amber-700 font-medium">Monthly Per Diem Budget</div>
+                  <div id="rem_monthly" class="text-2xl font-extrabold text-amber-900 mt-1">0.00</div>
+                </div>
+              </div>
+            </div>
+            <div class="rounded-xl p-5 bg-gradient-to-r from-emerald-100 to-emerald-50 border border-emerald-200 shadow-sm">
+              <div class="flex items-center gap-3">
+                <div class="p-3 rounded-full bg-emerald-200 text-emerald-800"><i class="fas fa-coins"></i></div>
+                <div>
+                  <div class="text-sm text-emerald-700 font-medium" id="yearly_label">Available Yearly Per Diem Budget</div>
+                  <div id="rem_yearly" class="text-2xl font-extrabold text-emerald-900 mt-1">0.00</div>
+                </div>
+              </div>
+            </div>
+            <div id="programs_total_card" class="rounded-xl p-5 bg-gradient-to-r from-purple-100 to-purple-50 border border-purple-200 shadow-sm" style="display:none;">
+              <div class="flex items-center gap-3">
+                <div class="p-3 rounded-full bg-purple-200 text-purple-800"><i class="fas fa-layer-group"></i></div>
+                <div>
+                  <div class="text-sm text-purple-700 font-medium">Bureau’s Programs Total Budget</div>
+                  <div id="programs_total_amount" class="text-2xl font-extrabold text-purple-900 mt-1">0.00 ብር</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="government_grand_card" class="rounded-xl p-5 mt-4 bg-gradient-to-r from-purple-100 to-purple-50 border border-purple-200 shadow-sm" style="display:none;">
+            <div class="flex items-center gap-3">
+              <div class="p-3 rounded-full bg-purple-200 text-purple-800"><i class="fas fa-building"></i></div>
+              <div>
+                <div id="gov_grand_label" class="text-sm text-purple-700 font-medium">Bureau’s Yearly Government Budget</div>
+                <div id="gov_grand_amount" class="text-2xl font-extrabold text-purple-900 mt-1">0.00 ብር</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="flex justify-end space-x-4 pt-2">
+            <?php if (isset($perdium)): ?>
+              <a href="perdium.php" class="px-4 py-2 bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-500">Cancel</a>
+            <?php endif; ?>
+            <button id="submitBtn" type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
+              <?php echo isset($perdium) ? 'Update Transaction' : 'Add Transaction'; ?>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div class="bg-white rounded-xl p-4 shadow-sm mb-4">
+        <div class="grid md:grid-cols-4 gap-3">
+          <div>
+            <label class="block text-sm font-medium mb-1">Budget Source</label>
+            <select id="flt_type" class="w-full select2">
+              <option value="governmental">Government</option>
+              <option value="program">Programs</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Owner</label>
+            <select id="flt_owner" class="w-full select2">
+              <option value="">Any Owner</option>
+              <?php foreach ($gov_owners as $o): ?>
+                <option value="<?php echo (int)$o['id']; ?>" data-budget-type="governmental"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
+              <?php endforeach; ?>
+              <?php foreach ($prog_owners as $o): ?>
+                <option value="<?php echo (int)$o['id']; ?>" data-budget-type="program"><?php echo htmlspecialchars($o['code'].' - '.$o['name']); ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div id="flt_month_box">
+            <label class="block text-sm font-medium mb-1">Month (Gov only)</label>
+            <select id="flt_month" class="w-full select2">
+              <option value="">Any Month</option>
+              <?php foreach ($months as $m): ?>
+                <option value="<?php echo htmlspecialchars($m); ?>"><?php echo htmlspecialchars($m); ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Employee</label>
+            <select id="flt_employee" class="w-full select2">
+              <option value="">Any Employee</option>
+              <?php foreach ($employees as $e): ?>
+                <option value="<?php echo (int)$e['id']; ?>"><?php echo htmlspecialchars($e['name'] ?? $e['name_am'] ?? ''); ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="mb-4">
+        <input type="text" id="searchInput" placeholder="Search transactions..." class="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" onkeyup="filterTransactions()">
+      </div>
+
+      <div class="bg-white rounded-xl p-6 shadow-sm">
+        <h2 class="text-xl font-bold text-slate-800 mb-6">Per Diem Transactions</h2>
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+              <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Employee</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Owner</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Destination</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Month</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Amount</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+              </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200" id="transactionsTable">
+              <tr><td colspan="7" class="px-4 py-4 text-center text-sm text-gray-500">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+  <script>
+    const defaultPerdiumRate = <?php echo json_encode((float)($_POST['perdium_rate'] ?? ($perdium['perdium_rate'] ?? 100))); ?>;
+    let filling = false;
+    const isEdit = <?php echo isset($perdium) ? 'true' : 'false'; ?>;
+    const isAdmin = <?php echo $is_admin ? 'true' : 'false'; ?>;
+    const isOfficer = <?php echo $is_officer ? 'true' : 'false'; ?>;
+    const csrfToken = <?php echo json_encode($_SESSION['csrf']); ?>;
+
+    let currentEmployeeSalary = 0;
+    let activeBlock = false;
+    let overlapConflict = false;
+    let lockForOfficer = false; // persists until employee changes
+
+    function fmt(n){return (Number(n)||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
+    function birr(n){return fmt(n)+' ብር';}
+    function esc(s){return String(s ?? '').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
+
+    function setDateInputsDisabled(disabled) {
+      const ids = ['#departure_date','#arrival_date','#total_days'];
+      ids.forEach(sel => {
+        $(sel).prop('disabled', disabled);
+        if (disabled) $(sel).addClass('input-locked'); else $(sel).removeClass('input-locked');
+      });
+    }
+    function applyOfficerLock() {
+      if (!isOfficer) return;
+      setDateInputsDisabled(lockForOfficer);
+      const shouldDisableSubmit = lockForOfficer || activeBlock || overlapConflict;
+      $('#submitBtn').prop('disabled', shouldDisableSubmit);
+    }
+
+    function calculatePerdium() {
+      const daysRaw = parseInt($('#total_days').val(), 10) || 0;
+      const days = Math.max(1, daysRaw);
+      const rate = parseFloat($('#perdium_rate').val()) || 0;
+
+      let totalAmount = 0;
+      if (rate > 0) {
+        const A = rate * (0.1 + 0.25 + 0.25);
+        const mid = Math.max(0, days - 2);
+        const C = rate * (0.1 + 0.25);
+        const nights = Math.max(0, days - 1);
+        totalAmount = A + (A * mid) + C + (rate * 0.4 * nights);
+      }
+      $('#total_amount').val(totalAmount.toFixed(2));
+      $('#total_amount_card').text(birr(totalAmount));
+      $('#total_days_card').text(daysRaw);
+    }
+
+    function updateDates() {
+      const totalDays = parseInt($('#total_days').val(),10) || 0;
+      if (totalDays > 0) {
+        if (!$('#departure_date').val()) {
+          const tomorrow = new Date();
+          tomorrow.setDate(tomorrow.getDate() + 1);
+          $('#departure_date').val(tomorrow.toISOString().split('T')[0]);
+        }
+        if ($('#departure_date').val()) {
+          const departureDate = new Date($('#departure_date').val());
+          const arrivalDate = new Date(departureDate);
+          arrivalDate.setDate(departureDate.getDate() + Math.max(0, totalDays - 1)); // inclusive date range
+          $('#arrival_date').val(arrivalDate.toISOString().split('T')[0]);
+        }
+      }
+      calculatePerdium();
+      checkOverlapForDates();
+    }
+
+    function calculatePerdiumRate() {
+      if (!currentEmployeeSalary || !$('#city_id').val()) return;
+      const cityOption = $('#city_id').find('option:selected');
+      const rateLow = parseFloat(cityOption.data('rate-low')) || 0;
+      const rateMedium = parseFloat(cityOption.data('rate-medium')) || 0;
+      const rateHigh = parseFloat(cityOption.data('rate-high')) || 0;
+      let rate = rateLow;
+      if (currentEmployeeSalary > 10000) rate = rateHigh;
+      else if (currentEmployeeSalary > 5000) rate = rateMedium;
+      $('#perdium_rate').val(rate.toFixed(2));
+      calculatePerdium();
+    }
+
+    function updateOwnerDetailsCard() {
+      const type = $('#budget_type').val();
+      const selectedOption = $('#owner_id').find('option:selected');
+      const ownerText = selectedOption.length ? selectedOption.text() : '';
+      const ownerName = ownerText.split(' - ')[1] || ownerText || '-';
+      $('#owner_name_display').text(ownerName);
+      if (type === 'governmental') {
+        const pkoox = selectedOption.data('p_koox') || '-';
+        $('#p_koox_display').text(pkoox);
+        $('#p_koox_row').show();
+      } else {
+        $('#p_koox_display').text('-');
+        $('#p_koox_row').hide();
+      }
+    }
+
+    function fetchAndPopulateOwners(preselectId=null) {
+      const budgetType = $('#budget_type').val();
+      const ownerSelect = $('#owner_id');
+      const perdiumOwnerId = '<?php echo isset($perdium) ? (int)$perdium["budget_owner_id"] : ""; ?>';
+      const perdiumBudgetType = '<?php echo isset($perdium) ? $perdium["budget_type"] : ""; ?>';
+      ownerSelect.prop('disabled', true).html('<option value="">Loading...</option>').trigger('change.select2');
+      $.ajax({
+        url: 'ajax_get_owners.php',
+        type: 'GET',
+        data: { budget_type: budgetType },
+        dataType: 'json',
+        success: function(response) {
+          if (response.success && Array.isArray(response.owners)) {
+            ownerSelect.html('<option value="">Select Owner</option>');
+            response.owners.forEach(function(owner) {
+              const option = new Option(`${owner.code} - ${owner.name}`, owner.id);
+              if (budgetType === 'governmental' && owner.p_koox) $(option).data('p_koox', owner.p_koox);
+              ownerSelect.append(option);
+            });
+            if (preselectId) ownerSelect.val(String(preselectId));
+            else if (isEdit && perdiumOwnerId && perdiumBudgetType === budgetType) ownerSelect.val(String(perdiumOwnerId));
+          } else {
+            ownerSelect.html('<option value="">Error loading owners</option>');
+          }
+        },
+        error: function() {
+          ownerSelect.html('<option value="">Error loading owners</option>');
+        },
+        complete: function() {
+          ownerSelect.prop('disabled', false).trigger('change.select2');
+          if (ownerSelect.val()) ownerSelect.trigger('change');
+          updateOwnerDetailsCard();
+        }
+      });
+    }
+
+    function updateFilterOwnerOptions() {
+      const budgetType = $('#flt_type').val();
+      const fltOwnerSelect = $('#flt_owner');
+      fltOwnerSelect.find('option').each(function() {
+        const option = $(this);
+        const optionBudgetType = option.data('budget-type');
+        if (!optionBudgetType || optionBudgetType === budgetType) {
+          option.prop('disabled', false);
+        } else {
+          option.prop('disabled', true);
+          if (option.is(':selected')) fltOwnerSelect.val('');
+        }
+      });
+      fltOwnerSelect.trigger('change.select2');
+    }
+
+    function setBudgetTypeUI(type) {
+      if (type === 'program') {
+        $('#et_month_box').hide();
+        $('#et_month').prop('required', false);
+        $('#rem_monthly_card').hide();
+        $('#yearly_label').text('Available Yearly Budget');
+        $('#flt_month_box').hide();
+      } else {
+        $('#et_month_box').show();
+        $('#et_month').prop('required', true);
+        $('#rem_monthly_card').show();
+        $('#yearly_label').text('Available Yearly Per Diem Budget');
+        $('#flt_month_box').show();
+      }
+      applyOfficerLock(); // keep lock across type changes
+    }
+
+    function resetPerdiumFormOnTypeSwitch(){
+      filling = true;
+      $('#owner_id').val('').trigger('change.select2');
+      $('#employee_id').val('').trigger('change.select2');
+      $('#city_id').val('').trigger('change.select2');
+      $('#et_month').val('').trigger('change.select2');
+      filling = false;
+
+      $('#departure_date').val('');
+      $('#arrival_date').val('');
+      $('#total_days').val('');
+      $('#perdium_rate').val(defaultPerdiumRate);
+      $('#total_amount').val(0);
+      $('#employee_position_display').text('-');
+      $('#employee_department_display').text('Department: -');
+      $('#employee_salary_display').text('Salary: -');
+      $('#owner_name_display').text('-');
+      $('#p_koox_row').hide();
+      $('#p_koox_display').text('-');
+
+      $('#total_days_card').text('0');
+      $('#total_amount_card').text('0.00 ብር');
+
+      $('#rem_monthly').text('0.00');
+      $('#rem_yearly').text('0.00');
+      $('#programs_total_card').hide();
+      $('#government_grand_card').hide();
+
+      // Lock persists until employee changes
+      $('#employeeActiveWarning').addClass('hidden');
+      $('#employeeOverlapWarning').addClass('hidden');
+
+      $('#flt_type').val($('#budget_type').val()).trigger('change.select2');
+      $('#flt_owner').val('').trigger('change.select2');
+      $('#flt_month').val('').trigger('change.select2');
+      $('#flt_employee').val('').trigger('change.select2');
+
+      fetchPerdiumList();
+    }
+
+    function onBudgetTypeChange(){
+      const t = $('#budget_type').val();
+      setBudgetTypeUI(t);
+      resetPerdiumFormOnTypeSwitch();
+      fetchAndPopulateOwners();
+    }
+
+    function onOwnerChange(){
+      if (filling) return;
+      updateOwnerDetailsCard();
+      $('#flt_owner').val($('#owner_id').val()).trigger('change.select2');
+      fetchPerdiumList();
+      loadPerdiumRemaining();
+      refreshGrandTotals();
+      applyOfficerLock();
+    }
+
+    function onEmployeeChange() {
+      if (filling) return;
+      // Unlock on employee change (lock will reapply if conflicts found)
+      lockForOfficer = false;
+      applyOfficerLock();
+
+      const selectedOption = $('#employee_id').find('option:selected');
+      const employeeText = selectedOption.text();
+      const parts = employeeText.split(' - ');
+      if (parts.length > 1) {
+        $('#employee_position_display').text(parts[1]);
+        $('#employee_department_display').text('Department: ' + (selectedOption.data('department') || '-'));
+      } else {
+        $('#employee_position_display').text('-');
+        $('#employee_department_display').text('Department: -');
+      }
+      currentEmployeeSalary = parseFloat(selectedOption.data('salary')) || 0;
+      $('#employee_salary_display').text('Salary: ' + fmt(currentEmployeeSalary));
+      calculatePerdiumRate();
+      $('#flt_employee').val($('#employee_id').val()).trigger('change.select2');
+      fetchPerdiumList();
+      checkEmployeeActive();
+      checkOverlapForDates();
+    }
+
+    function onCityChange() { if (!filling) calculatePerdiumRate(); }
+
+    function loadPerdiumRemaining(){
+      const ownerId = $('#owner_id').val();
+      const etMonth = $('#et_month').val();
+      const year = new Date().getFullYear() - 8;
+      const type = $('#budget_type').val();
+
+      if (!ownerId) { $('#rem_monthly').text('0.00'); $('#rem_yearly').text('0.00'); return; }
+      if (type === 'program') {
+        $.get('get_remaining_program.php', { owner_id: ownerId, year: year }, function(resp){
+          try {
+            const j = typeof resp === 'string' ? JSON.parse(resp) : resp;
+            $('#rem_yearly').text(fmt(j.remaining_yearly || 0));
+            $('#rem_monthly').text('0.00');
+          } catch (e) { $('#rem_yearly').text('0.00'); }
+        }).fail(()=>$('#rem_yearly').text('0.00'));
+      } else {
+        if (!etMonth) { $('#rem_monthly').text('0.00'); $('#rem_yearly').text('0.00'); return; }
+        $.get('get_remaining_perdium.php', { owner_id: ownerId, code_id: 6, month: etMonth, year: year }, function(resp){
+          try {
+            const rem = typeof resp === 'string' ? JSON.parse(resp) : resp;
+            $('#rem_monthly').text(fmt(rem.remaining_monthly || 0));
+            $('#rem_yearly').text(fmt(rem.remaining_yearly || 0));
+          } catch (e) {
+            $('#rem_monthly').text('0.00'); $('#rem_yearly').text('0.00');
+          }
+        }).fail(()=>{ $('#rem_monthly').text('0.00'); $('#rem_yearly').text('0.00'); });
+      }
+    }
+
+    function refreshGrandTotals(){
+      const type    = $('#budget_type').val();
+      const ownerId = $('#owner_id').val();
+      const year    = new Date().getFullYear() - 8;
+
+      $.get('ajax_perdium_grands.php',{ budget_type:type, owner_id:ownerId, year:year }, function(resp){
+        try{
+          const j = typeof resp === 'string' ? JSON.parse(resp) : resp;
+          if (type === 'program') {
+            if (!ownerId) {
+              $('#programs_total_card').show();
+              $('#programs_total_amount').text(birr(j.programsTotalYearly || 0));
+            } else {
+              $('#programs_total_card').hide();
+            }
+            $('#government_grand_card').hide();
+          } else {
+            $('#programs_total_card').hide();
+            $('#government_grand_card').show();
+            if (!ownerId) {
+              $('#gov_grand_label').text("Bureau’s Yearly Government Budget");
+              $('#gov_grand_amount').text(birr(j.govtBureauRemainingYearly || 0));
+            } else {
+              const ownerName = $('#owner_id option:selected').text().split(' - ')[1] || 'Selected Owner';
+              $('#gov_grand_label').text(`${ownerName}'s Total Yearly Budget (Grand Yearly Budget)`);
+              $('#gov_grand_amount').text(birr(j.govtOwnerYearlyRemaining || 0));
+            }
+          }
+        }catch(e){
+          $('#programs_total_card').hide();
+          $('#government_grand_card').hide();
+        }
+      }).fail(function(){
+        $('#programs_total_card').hide();
+        $('#government_grand_card').hide();
+      });
+    }
+
+    function toggleFilterMonth(){
+      const t = $('#flt_type').val();
+      if (t === 'program') { $('#flt_month_box').hide(); } else { $('#flt_month_box').show(); }
+    }
+
+    function syncFiltersFromForm(){
+      $('#flt_type').val($('#budget_type').val()).trigger('change.select2');
+      $('#flt_owner').val($('#owner_id').val()).trigger('change.select2');
+      $('#flt_month').val($('#et_month').val()).trigger('change.select2');
+      $('#flt_employee').val($('#employee_id').val()).trigger('change.select2');
+    }
+
+    function validateBeforeSubmit(){
+      if (isOfficer && (lockForOfficer || activeBlock || overlapConflict)) {
+        alert('This employee has an active or overlapping per diem. Fields are locked and submission is blocked.');
+        return false;
+      }
+      syncFiltersFromForm();
+      return true;
+    }
+
+    function fetchPerdiumList(){
+      const type  = $('#flt_type').val();
+      const owner = $('#flt_owner').val();
+      const month = $('#flt_month').val();
+      const employee = $('#flt_employee').val();
+      $('#transactionsTable').html('<tr><td colspan="7" class="px-4 py-4 text-center text-sm text-gray-500">Loading…</td></tr>');
+      $.get('ajax_perdium_list.php', { budget_type:type, owner_id:owner, et_month:month, employee_id:employee }, function(resp){
+        try{
+          const j = typeof resp === 'string' ? JSON.parse(resp) : resp;
+          const rows = j.rows || [];
+          if(rows.length===0){
+            $('#transactionsTable').html('<tr><td colspan="7" class="px-4 py-4 text-center text-sm text-gray-500">No per diem transactions found.</td></tr>');
+            return;
+          }
+          let html='';
+          rows.forEach(f=>{
+            const printUrl = (f.budget_type==='program')
+              ? `reports/preport2.php?id=${f.id}`
+              : `reports/preport.php?id=${f.id}`;
+            const dataJson = encodeURIComponent(JSON.stringify(f));
+            let actions = `
+              <a href="${printUrl}" class="px-3 py-1 bg-green-100 text-green-700 rounded-md hover:bg-green-200" target="_blank">
+                <i class="fas fa-print mr-1"></i> Print
+              </a>
+            `;
+            <?php if ($is_admin): ?>
+            actions += `
+              <a href="?action=edit&id=${f.id}" class="px-3 py-1 bg-blue-100 text-blue-700 rounded-md hover:bg-blue-200">
+                <i class="fas fa-edit mr-1"></i> Edit
+              </a>
+              <form method="POST" style="display:inline" onsubmit="return confirm('Are you sure you want to delete this transaction?')">
+                <input type="hidden" name="action" value="delete">
+                <input type="hidden" name="id" value="${f.id}">
+                <input type="hidden" name="csrf" value="${csrfToken}">
+                <button class="px-3 py-1 bg-red-100 text-red-700 rounded-md hover:bg-red-200">
+                  <i class="fas fa-trash mr-1"></i> Delete
+                </button>
+              </form>
+            `;
+            <?php endif; ?>
+            html += `
+              <tr class="row-click" data-json="${dataJson}">
+                <td class="px-4 py-4 text-sm text-gray-900">${esc((f.created_at||'').replace('T',' ').slice(0,19))}</td>
+                <td class="px-4 py-4 text-sm text-gray-900">${esc(f.employee_name || '')}</td>
+                <td class="px-4 py-4 text-sm text-gray-900">${esc(f.owner_code || '')}</td>
+                <td class="px-4 py-4 text-sm text-gray-900">${esc(f.city_name || '')}</td>
+                <td class="px-4 py-4 text-sm text-gray-900 ethio-font">${esc(f.et_month || '')}</td>
+                <td class="px-4 py-4 text-sm text-gray-900">${Number(f.total_amount||0).toLocaleString(undefined,{minimumFractionDigits:2})}</td>
+                <td class="px-4 py-4 text-sm"><div class="flex space-x-2">${actions}</div></td>
+              </tr>`;
+          });
+          $('#transactionsTable').html(html);
+          filterTransactions();
+        }catch(e){
+          $('#transactionsTable').html('<tr><td colspan="7" class="px-4 py-4 text-center text-sm text-gray-500">Failed to load.</td></tr>');
+        }
+      }).fail(()=>$('#transactionsTable').html('<tr><td colspan="7" class="px-4 py-4 text-center text-sm text-gray-500">Failed to load.</td></tr>'));
+    }
+
+    function filterTransactions() {
+      const filter = (document.getElementById('searchInput').value||'').toLowerCase();
+      const rows = document.querySelectorAll('#transactionsTable tr');
+      rows.forEach(row=>{
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.includes(filter) ? '' : 'none';
+      });
+    }
+
+    function fillFormFromRow(d){
+      try{
+        filling = true;
+        $('#budget_type').val(d.budget_type || 'governmental').trigger('change.select2');
+        setBudgetTypeUI($('#budget_type').val());
+        fetchAndPopulateOwners(d.budget_owner_id);
+
+        if ((d.budget_type||'governmental') !== 'program') {
+          $('#et_month').val(d.et_month || '').trigger('change.select2');
+        } else {
+          $('#et_month').val('').trigger('change.select2');
+        }
+
+        $('#employee_id').val(String(d.employee_id||'')).trigger('change.select2');
+        onEmployeeChange();
+
+        $('#city_id').val(String(d.city_id||'')).trigger('change.select2');
+
+        $('#departure_date').val(d.departure_date || '');
+        $('#arrival_date').val(d.arrival_date || '');
+        $('#total_days').val(Number(d.total_days||0));
+        $('#perdium_rate').val(Number(d.perdium_rate||0).toFixed(2));
+        
+        calculatePerdium();
+
+        $('#flt_type').val(d.budget_type || 'governmental').trigger('change.select2');
+        updateFilterOwnerOptions();
+        $('#flt_owner').val(String(d.budget_owner_id||'')).trigger('change.select2');
+        if ((d.budget_type||'governmental') !== 'program') {
+          $('#flt_month').val(d.et_month || '').trigger('change.select2');
+        } else {
+          $('#flt_month').val('').trigger('change.select2');
+        }
+        $('#flt_employee').val(String(d.employee_id||'')).trigger('change.select2');
+        
+        filling = false;
+        loadPerdiumRemaining();
+        refreshGrandTotals();
+      }catch(e){
+        filling = false;
+        console.error('fillFormFromRow error', e);
+      }
+    }
+
+    // Active per-diem check
+    function checkEmployeeActive(){
+      const empId = $('#employee_id').val();
+      if (!empId) {
+        activeBlock = false;
+        if (!lockForOfficer) $('#submitBtn').prop('disabled', false);
+        $('#employeeActiveWarning').addClass('hidden');
+        applyOfficerLock();
+        return;
+      }
+      $.get('ajax_check_employee_perdium.php', { employee_id: empId, mode: 'active' }, function(resp){
+        try{
+          const j = typeof resp === 'string' ? JSON.parse(resp) : resp;
+          if (j.active) {
+            activeBlock = true;
+            if (isOfficer) { lockForOfficer = true; applyOfficerLock(); }
+            $('#block_until_date').text(j.block_until || '-');
+            $('#employeeActiveWarning').removeClass('hidden');
+            $('#submitBtn').prop('disabled', true);
+          } else {
+            activeBlock = false;
+            $('#employeeActiveWarning').addClass('hidden');
+            $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || overlapConflict) : overlapConflict);
+            applyOfficerLock();
+          }
+        }catch(e){
+          activeBlock = false;
+          $('#employeeActiveWarning').addClass('hidden');
+          $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || overlapConflict) : overlapConflict);
+          applyOfficerLock();
+        }
+      }).fail(function(){
+        activeBlock = false;
+        $('#employeeActiveWarning').addClass('hidden');
+        $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || overlapConflict) : overlapConflict);
+        applyOfficerLock();
+      });
+    }
+
+    // Overlap check
+    function checkOverlapForDates(){
+      const empId = $('#employee_id').val();
+      const dep = $('#departure_date').val();
+      const arr = $('#arrival_date').val();
+      if (!empId || !dep || !arr) {
+        overlapConflict = false;
+        $('#employeeOverlapWarning').addClass('hidden');
+        $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || activeBlock) : activeBlock);
+        applyOfficerLock();
+        return;
+      }
+      $.get('ajax_check_employee_perdium.php', { employee_id: empId, start: dep, end: arr, exclude_id: <?php echo isset($perdium) ? (int)$perdium['id'] : 'null'; ?> }, function(resp){
+        try{
+          const j = typeof resp === 'string' ? JSON.parse(resp) : resp;
+          if (j.overlap) {
+            overlapConflict = true;
+            if (isOfficer) { lockForOfficer = true; applyOfficerLock(); }
+            $('#employeeOverlapWarning').removeClass('hidden');
+            $('#submitBtn').prop('disabled', true);
+          } else {
+            overlapConflict = false;
+            $('#employeeOverlapWarning').addClass('hidden');
+            $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || activeBlock) : activeBlock);
+            applyOfficerLock();
+          }
+        }catch(e){
+          overlapConflict = false;
+          $('#employeeOverlapWarning').addClass('hidden');
+          $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || activeBlock) : activeBlock);
+          applyOfficerLock();
+        }
+      }).fail(function(){
+        overlapConflict = false;
+        $('#employeeOverlapWarning').addClass('hidden');
+        $('#submitBtn').prop('disabled', isOfficer ? (lockForOfficer || activeBlock) : activeBlock);
+        applyOfficerLock();
+      });
+    }
+
+    $(document).ready(function(){
+      $('.select2').select2({ theme:'classic', width:'100%',
+        matcher: function(params, data) {
+          if ($.trim(params.term) === '') return data;
+          if (typeof data.text === 'undefined') return null;
+          if (data.text.toLowerCase().indexOf(params.term.toLowerCase()) > -1) return data;
+          for (const key in data.element.dataset) {
+            if (String(data.element.dataset[key]).toLowerCase().indexOf(params.term.toLowerCase()) > -1) return data;
+          }
+          return null;
+        }
+      });
+
+      // Main form
+      $('#budget_type').on('change', function(){ if (!filling) onBudgetTypeChange(); });
+      $('#owner_id').on('change', function(){ if (!filling) onOwnerChange(); });
+      $('#employee_id').on('change', function(){ if (!filling) onEmployeeChange(); });
+      $('#city_id').on('change', function(){ if (!filling) onCityChange(); });
+      $('#et_month').on('change', function(){
+        if (filling) return;
+        $('#flt_month').val($('#et_month').val()).trigger('change.select2');
+        fetchPerdiumList();
+        loadPerdiumRemaining();
+      });
+      $('#departure_date, #arrival_date').on('change', function(){ checkOverlapForDates(); });
+
+      // Filters
+      $('#flt_type').on('change', function(){
+        updateFilterOwnerOptions();
+        toggleFilterMonth();
+        fetchPerdiumList();
+      });
+      $('#flt_owner, #flt_month, #flt_employee').on('change', function(){ fetchPerdiumList(); });
+
+      // Table row click
+      $('#transactionsTable').on('click', 'tr.row-click', function(e){
+        if ($(e.target).closest('a,button,form').length) return;
+        const dataJson = $(this).attr('data-json');
+        if (!dataJson) return;
+        try {
+          const d = JSON.parse(decodeURIComponent(dataJson));
+          fillFormFromRow(d);
+        } catch (err) { console.error('row parse error', err); }
+      });
+
+      // Initialize
+      setBudgetTypeUI($('#budget_type').val());
+      fetchAndPopulateOwners();
+      updateFilterOwnerOptions();
+      toggleFilterMonth();
+
+      if (isEdit) {
+        onEmployeeChange();
+        loadPerdiumRemaining();
+        refreshGrandTotals();
+        syncFiltersFromForm();
+      } else {
+        calculatePerdium();
+        loadPerdiumRemaining();
+        refreshGrandTotals();
+        syncFiltersFromForm();
+      }
+      fetchPerdiumList();
+    });
+
+    document.getElementById('sidebarToggle')?.addEventListener('click', ()=>{
+      document.getElementById('sidebar').classList.toggle('collapsed');
+      document.getElementById('mainContent').classList.toggle('expanded');
+    });
+  </script>
+</body>
+</html>

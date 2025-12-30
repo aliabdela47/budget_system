@@ -1,0 +1,18 @@
+===Database budget_db
+
+== Table structure for table users
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|**username**|varchar(50)|Yes|NULL
+|name|varchar(100)|Yes|NULL
+|password_hash|varchar(255)|Yes|NULL
+|role|enum(&#039;admin&#039;, &#039;officer&#039;)|Yes|NULL
+|profile_picture|varchar(255)|Yes|NULL
+== Dumping data for table users
+
+|1|admin|Ali Abdela|$2y$10$RYvzdURJXXYtC61mnCZrK.jjFvZa4GBglg9Yq9Wzafs2YtJQ4hJZi|admin|uploads/b843ed9daa37f608a986bb1828cbfae5.png
+|2|officer|Finance Officer|$2y$10$vZGY0LOWRsbWb86tDspx4u/.s8GAfn/chMhykhmBDFkd0GDfPRf2y|officer|NULL
+|5|superadmin|Abubeker Arba Oundie|$2y$10$RtX9Cwe/qXQQM2WcTtFkUONUabOwyANuT6CCJtLl2bISvHnUYXJ9K|admin|uploads/baa6deb51f4cec7f6e84ec6f6f2f203f.png

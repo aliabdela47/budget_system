@@ -1,0 +1,84 @@
+CREATE DATABASE budget_db;
+USE budget_db;
+
+CREATE TABLE budget_owners (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(10) UNIQUE,
+    name VARCHAR(100)
+);
+
+CREATE TABLE budget_codes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(10) UNIQUE,
+    name VARCHAR(100)
+);
+
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE,
+    password_hash VARCHAR(255),
+    role ENUM('admin', 'officer')
+);
+
+CREATE TABLE budgets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    owner_id INT,
+    code_id INT,
+    adding_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    year INT,
+    yearly_amount DECIMAL(15,2) DEFAULT 0,
+    month VARCHAR(20),
+    monthly_amount DECIMAL(15,2) DEFAULT 0,
+    quarter INT,
+    FOREIGN KEY (owner_id) REFERENCES budget_owners(id),
+    FOREIGN KEY (code_id) REFERENCES budget_codes(id)
+);
+
+CREATE TABLE transactions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    owner_id INT,
+    code_id INT,
+    employee_name VARCHAR(100),
+    ordered_by VARCHAR(100),
+    reason TEXT,
+    created_by VARCHAR(100),
+    amount DECIMAL(15,2),
+    date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    et_month VARCHAR(20),
+    quarter INT,
+    remaining_month DECIMAL(15,2),
+    remaining_quarter DECIMAL(15,2),
+    remaining_year DECIMAL(15,2),
+    FOREIGN KEY (owner_id) REFERENCES budget_owners(id),
+    FOREIGN KEY (code_id) REFERENCES budget_codes(id)
+);
+
+CREATE TABLE fuel_transactions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    owner_id INT,
+    driver_name VARCHAR(100),
+    plate_number VARCHAR(20),
+    previous_gauge DECIMAL(10,2),
+    current_gauge DECIMAL(10,2),
+    journey_distance DECIMAL(10,2),
+    fuel_price DECIMAL(10,2),
+    refuelable_amount DECIMAL(10,2),
+    total_amount DECIMAL(15,2),
+    new_gauge DECIMAL(10,2),
+    gauge_gap DECIMAL(10,2),
+    date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (owner_id) REFERENCES budget_owners(id)
+);
+
+-- Seed data
+INSERT INTO users (username, password_hash, role) VALUES 
+('admin', '$2y$10$K.I0N8Qf5Lq4Y7ZcD8f8qe8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f', 'admin'),
+('officer', '$2y$10$K.I0N8Qf5Lq4Y7ZcD8f8qe8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f', 'officer');
+
+INSERT INTO budget_owners (code, name) VALUES ('06', 'ICT Directorate');
+
+INSERT INTO budget_codes (code, name) VALUES 
+('6217', 'Fuel'), 
+('6231', 'Perdium'), 
+('6232', 'Transportation Payment'), 
+('6233', 'Refreshments for Guests');

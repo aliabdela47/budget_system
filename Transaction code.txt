@@ -1,0 +1,1901 @@
+my transaction.php page's code is as follows
+
+<?php
+session_start();
+include 'includes/db.php';
+include 'includes/functions.php';
+if (!isset($_SESSION['user_id'])) {
+    header('Location: index.php');
+    exit;
+}
+
+$owners = $pdo->query("SELECT * FROM budget_owners")->fetchAll();
+$codes = $pdo->query("SELECT * FROM budget_codes")->fetchAll();
+$transactions = $pdo->query("SELECT t.*, o.code AS owner_code, c.code AS budget_code 
+                             FROM transactions t 
+                             JOIN budget_owners o ON t.owner_id = o.id 
+                             JOIN budget_codes c ON t.code_id = c.id")->fetchAll();
+
+$trans = null;
+if (isset($_GET['action']) && $_GET['action'] == 'edit' && isset($_GET['id'])) {
+    $stmt = $pdo->prepare("SELECT * FROM transactions WHERE id = ?");
+    $stmt->execute([$_GET['id']]);
+    $trans = $stmt->fetch();
+}
+
+$et_info = getEtMonthAndQuarter(date('Y-m-d'));
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    $owner_id = $_POST['owner_id'];
+    $code_id = $_POST['code_id'];
+    $amount = (float)($_POST['amount'] ?? 0); // Default to 0 if blank
+    $et_month = $_POST['et_month'];
+    $quarterMap = [
+        'ሐምሌ' => 1, 'ነሐሴ' => 1, 'መስከረም' => 1,
+        'ጥቅምት' => 2, 'ህዳር' => 2, 'ታኅሣሥ' => 2,
+        'ጥር' => 3, 'የካቲቷ' => 3, 'መጋቢቷ' => 3,
+        'ሚያዝያ' => 4, 'ግንቦቷ' => 4, 'ሰኔ' => 4,
+    ];
+    $quarter = $quarterMap[$et_month] ?? 0;
+    $year = date('Y') - 8; // Ethiopian year adjustment
+
+    // Fetch monthly budget
+    $stmt = $pdo->prepare("SELECT * FROM budgets WHERE owner_id = ? AND code_id = ? AND year = ? AND month = ?");
+    $stmt->execute([$owner_id, $code_id, $year, $et_month]);
+    $budget = $stmt->fetch();
+
+    // Fetch yearly budget
+    $stmt = $pdo->prepare("SELECT * FROM budgets WHERE owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0");
+    $stmt->execute([$owner_id, $code_id, $year]);
+    $budget_yearly = $stmt->fetch();
+
+    if ($budget_yearly || $budget) {
+        $yearly_amount = $budget_yearly ? $budget_yearly['yearly_amount'] : 0;
+        $monthly_amount = $budget ? $budget['monthly_amount'] : 0;
+
+        // Calculate total spent from transactions
+        $stmt = $pdo->prepare("SELECT SUM(amount) FROM transactions WHERE owner_id = ? AND code_id = ? AND YEAR(date) = ?");
+        $stmt->execute([$owner_id, $code_id, date('Y')]);
+        $trans_year = $stmt->fetchColumn() ?: 0;
+        $calculated_remaining_year = $yearly_amount - $trans_year;
+
+        $stmt = $pdo->prepare("SELECT SUM(amount) FROM transactions WHERE owner_id = ? AND code_id = ? AND et_month = ? AND YEAR(date) = ?");
+        $stmt->execute([$owner_id, $code_id, $et_month, date('Y')]);
+        $trans_month = $stmt->fetchColumn() ?: 0;
+        $calculated_remaining_month = $monthly_amount - $trans_month;
+
+        $stmt = $pdo->prepare("SELECT SUM(monthly_amount) FROM budgets WHERE owner_id = ? AND code_id = ? AND year = ? AND quarter = ?");
+        $stmt->execute([$owner_id, $code_id, $year, $quarter]);
+        $quarterly_alloc = $stmt->fetchColumn() ?: 0;
+
+        $stmt = $pdo->prepare("SELECT SUM(amount) FROM transactions WHERE owner_id = ? AND code_id = ? AND quarter = ? AND YEAR(date) = ?");
+        $stmt->execute([$owner_id, $code_id, $quarter, date('Y')]);
+        $trans_quarter = $stmt->fetchColumn() ?: 0;
+        $calculated_remaining_quarter = $quarterly_alloc - $trans_quarter;
+
+        if (!$budget) {
+            $calculated_remaining_month = $calculated_remaining_year;
+        }
+
+        if ($quarterly_alloc == 0) {
+            $calculated_remaining_quarter = $calculated_remaining_year;
+        }
+
+        // Enhanced validation
+        if ($amount < 0) {
+            $message = 'Amount cannot be negative';
+        } elseif ($amount > 0 && !$budget_yearly && !$budget) {
+            $message = 'No budget allocated for this combination';
+        } elseif ($amount > 0 && min($calculated_remaining_month, $calculated_remaining_quarter, $calculated_remaining_year) < $amount) {
+            $message = 'Transaction amount exceeds remaining budget (Monthly: ' . number_format($calculated_remaining_month, 2) . ', Quarterly: ' . number_format($calculated_remaining_quarter, 2) . ', Yearly: ' . number_format($calculated_remaining_year, 2) . ')';
+        } else {
+            $pdo->beginTransaction();
+            try {
+                // Update budgets table with new amounts (initial amounts reduced by consumption)
+                
+                
+                if ($amount > 0 && $budget) {
+                    $new_monthly_amount = $monthly_amount - $amount;
+                    $stmt = $pdo->prepare("UPDATE budgets SET monthly_amount = ? WHERE id = ?");
+                    $stmt->execute([$new_monthly_amount, $budget['id']]);
+                }
+                
+                // removed by copilot recommendatio
+                
+              //  if ($amount > 0 && $budget_yearly) {
+               //     $new_yearly_amount = $yearly_amount - $amount;
+                //    $stmt = $pdo->prepare("UPDATE budgets SET yearly_amount = ? // WHERE id = ?");
+                //    $stmt->execute([$new_yearly_amount, $budget_yearly['id']]);
+             //   }
+
+                // removed by copilot recommendatio
+                
+                
+                // Insert or update transaction
+                $new_remaining_monthly = $calculated_remaining_month - $amount;
+                $new_remaining_quarterly = $calculated_remaining_quarter - $amount;
+                $new_remaining_yearly = $calculated_remaining_year - $amount;
+
+                if (isset($_POST['id']) && $_POST['action'] == 'update') {
+                    $stmt = $pdo->prepare("UPDATE transactions SET owner_id = ?, code_id = ?, employee_name = ?, ordered_by = ?, reason = ?, amount = ?, et_month = ?, quarter = ?, remaining_month = ?, remaining_quarter = ?, remaining_year = ? WHERE id = ?");
+                    $stmt->execute([$owner_id, $code_id, $_POST['employee_name'], $_POST['ordered_by'], $_POST['reason'], $amount, $et_month, $quarter, $new_remaining_monthly, $new_remaining_quarterly, $new_remaining_yearly, $_POST['id']]);
+                    $message = 'Transaction updated';
+                } else {
+                    $stmt = $pdo->prepare("INSERT INTO transactions (owner_id, code_id, employee_name, ordered_by, reason, created_by, amount, et_month, quarter, remaining_month, remaining_quarter, remaining_year, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+                    $stmt->execute([$owner_id, $code_id, $_POST['employee_name'], $_POST['ordered_by'], $_POST['reason'], $_SESSION['username'], $amount, $et_month, $quarter, $new_remaining_monthly, $new_remaining_quarterly, $new_remaining_yearly]);
+                    $message = 'Transaction added';
+                }
+
+                $pdo->commit();
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $message = 'Error: ' . $e->getMessage();
+            }
+        }
+    } else {
+        if ($amount > 0) {
+            $message = 'No budget allocated for this combination';
+        } else {
+            // Allow zero amount transaction with no budget
+            $pdo->beginTransaction();
+            try {
+                $stmt = $pdo->prepare("INSERT INTO transactions (owner_id, code_id, employee_name, ordered_by, reason, created_by, amount, et_month, quarter, remaining_month, remaining_quarter, remaining_year, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+                $stmt->execute([$owner_id, $code_id, $_POST['employee_name'], $_POST['ordered_by'], $_POST['reason'], $_SESSION['username'], $amount, $et_month, $quarter, 0, 0, 0]);
+                $message = 'Transaction with zero amount added';
+                $pdo->commit();
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $message = 'Error: ' . $e->getMessage();
+            }
+        }
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Transaction - Budget System</title>
+   <script src="css/tailwind.css"> </script>
+  <link rel="stylesheet" href="css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#4f46e5',
+                        secondary: '#7c3aed',
+                        light: '#f8fafc',
+                        lighter: '#f1f5f9',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
+            min-height: 100vh;
+            color: #334155;
+        }
+        
+        .ethiopic {
+            font-family: 'Noto Sans Ethiopic', sans-serif;
+        }
+        
+        .card-hover {
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        
+        .card-hover:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        
+        .sidebar {
+            width: 260px;
+            position: fixed;
+            left: 0;
+            top: 0;
+            height: 100vh;
+            z-index: 1000;
+            background: linear-gradient(180deg, #4f46e5 0%, #7c3aed 100%);
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
+            color: white;
+            transition: transform 0.3s ease;
+        }
+        
+        .sidebar.collapsed {
+            transform: translateX(-260px);
+        }
+        
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-260px);
+            }
+            
+            .sidebar.active {
+                transform: translateX(0);
+            }
+        }
+        
+        .main-content {
+            transition: margin-left 0.3s ease;
+            margin-left: 260px;
+            width: calc(100% - 260px);
+        }
+        
+        .main-content.expanded {
+            margin-left: 0;
+            width: 100%;
+        }
+        
+        .input-group {
+            transition: all 0.3s ease;
+            border: 1px solid #d1d5db;
+            border-radius: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            display: flex;
+            align-items: center;
+        }
+        
+        .input-group:focus-within {
+            transform: translateY(-2px);
+            border-color: #4f46e5;
+            box-shadow: 0 0 0 1px #4f46e5;
+        }
+        
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            10%, 30%, 50%, 70%, 90% { transform: translateX(-5px); }
+            20%, 40%, 60%, 80% { transform: translateX(5px); }
+        }
+        
+        .shake {
+            animation: shake 0.5s;
+        }
+        
+        input, select, textarea {
+            outline: none;
+            width: 100%;
+            background: transparent;
+        }
+        
+        .btn-primary {
+            background-color: #4f46e5;
+            color: white;
+            padding: 0.75rem 1rem;
+            border-radius: 0.5rem;
+            font-weight: 500;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .btn-primary:hover {
+            background-color: #4338ca;
+        }
+        
+        .btn-secondary {
+            background-color: #6b7280;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-weight: 500;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .btn-secondary:hover {
+            background-color: #4b5563;
+        }
+        
+        .btn-danger {
+            background-color: #ef4444;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-weight: 500;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .btn-danger:hover {
+            background-color: #dc2626;
+        }
+        
+        .btn-info {
+            background-color: #06b6d4;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-weight: 500;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .btn-info:hover {
+            background-color: #0891b2;
+        }
+    </style>
+</head>
+<body class="text-slate-700 flex">
+    <!-- Sidebar -->
+    <div class="sidebar" id="sidebar">
+        <div class="p-5">
+            <div class="flex items-center justify-center mb-8">
+                <i class="fas fa-wallet text-amber-300 text-3xl mr-3"></i>
+                <h2 class="text-xl font-bold text-white">Budget System</h2>
+            </div>
+            <ul class="space-y-2">
+                <li>
+                    <a href="dashboard.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                        <i class="fas fa-tachometer-alt w-5"></i>
+                        <span class="ml-3">Dashboard</span>
+                    </a>
+                </li>
+                <?php if ($_SESSION['role'] == 'admin'): ?>
+                    <li>
+                        <a href="budget_adding.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                            <i class="fas fa-plus-circle w-5"></i>
+                            <span class="ml-3">Budget Adding</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="settings_owners.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                            <i class="fas fa-building w-5"></i>
+                            <span class="ml-3">Settings Owners</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="settings_codes.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                            <i class="fas fa-code w-5"></i>
+                            <span class="ml-3">Settings Codes</span>
+                        </a>
+                    </li>
+                <?php endif; ?>
+                <li>
+                    <a href="transaction.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white bg-white/20">
+                        <i class="fas fa-exchange-alt w-5"></i>
+                        <span class="ml-3">Transaction</span>
+                    </a>
+                </li>
+                <li>
+                    <a href="fuel_management.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                        <i class="fas fa-gas-pump w-5"></i>
+                        <span class="ml-3">Fuel Management</span>
+                    </a>
+                </li>
+                <li>
+                  
+                  <li>
+                    <a href="perdium.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                        <i class="fas fa-dollar-sign w-5"></i>
+                        <span class="ml-3">Perdium Management</span>
+                    </a>
+                </li>
+                <li>
+                    <a href="users_management.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                        <i class="fas fa-users w-5"></i>
+                        <span class="ml-3">Users Management</span>
+                    </a>
+                </li>
+                <li>
+                    <a href="logout.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+                        <i class="fas fa-sign-out-alt w-5"></i>
+                        <span class="ml-3">Logout</span>
+                    </a>
+                </li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content" id="mainContent">
+        <div class="p-6">
+            <!-- Header -->
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 p-6 bg-white rounded-xl shadow-sm">
+                <div>
+                    <h1 class="text-2xl md:text-3xl font-bold text-slate-800">
+                        Transaction Management
+                    </h1>
+                    <p class="text-slate-600 mt-2">Add and manage financial transactions</p>
+                </div>
+                <div class="flex items-center space-x-4 mt-4 md:mt-0">
+                    <button class="bg-slate-200 hover:bg-slate-300 text-slate-700 p-2 rounded-lg md:hidden shadow-sm" id="sidebarToggle">
+                        <i class="fas fa-bars"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Transaction Form -->
+            <div class="bg-white rounded-xl p-6 card-hover mb-8">
+                <h2 class="text-xl font-bold text-slate-800 mb-6">Transaction Form</h2>
+                <?php if (isset($message)): ?>
+                    <div class="bg-blue-50 text-blue-700 p-4 rounded-lg mb-6">
+                        <i class="fas fa-info-circle mr-2"></i>
+                        <?php echo htmlspecialchars($message); ?>
+                    </div>
+                <?php endif; ?>
+                <form method="post" class="space-y-6">
+                    <?php if ($trans): ?>
+                        <input type="hidden" name="id" value="<?php echo $trans['id']; ?>">
+                        <input type="hidden" name="action" value="update">
+                    <?php endif; ?>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Budget Owners Code</label>
+                            <select name="owner_id" class="input-group" onchange="loadAvailable()" required>
+                                <?php foreach ($owners as $o): ?>
+                                    <option value="<?php echo $o['id']; ?>" <?php echo ($trans && $trans['owner_id'] == $o['id']) ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Budget Code</label>
+                            <select name="code_id" class="input-group" onchange="loadAvailable()" required>
+                                <?php
+                                if (!empty($codes)) {
+                                    foreach ($codes as $c) {
+                                        echo '<option value="' . htmlspecialchars($c['id']) . '"';
+                                        if ($trans && $trans['code_id'] == $c['id']) {
+                                            echo ' selected';
+                                        }
+                                        echo '>' . htmlspecialchars($c['code'] . ' - ' . $c['name']) . '</option>';
+                                    }
+                                } else {
+                                    echo '<option value="">No budget codes available</option>';
+                                }
+                                ?>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Ethiopian Month</label>
+                            <select name="et_month" id="month" class="input-group" onchange="updateQuarter(); loadAvailable();" required>
+                                <?php
+                                $etMonths = ['መስከረም', 'ጥቅምት', 'ኅዳር', 'ታኅሣሥ', 'ጥር', 'የካቲት', 'መጋቢት', 'ሚያዝያ', 'ግንቦት', 'ሰኔ', 'ሐምሌ', 'ነሐሴ'];
+                                foreach ($etMonths as $month) {
+                                    echo '<option value="' . htmlspecialchars($month) . '"';
+                                    if (($trans && $trans['et_month'] == $month) || (!$trans && $et_info['etMonth'] == $month)) {
+                                        echo ' selected';
+                                    }
+                                    echo '>' . htmlspecialchars($month) . '</option>';
+                                }
+                                ?>
+                            </select>
+                            <div class="mt-2">
+                                <label class="block text-sm font-medium text-slate-700">Quarter: <span id="quarter_label" class="font-bold"><?php echo $trans ? $trans['quarter'] : $et_info['quarter']; ?></span></label>
+                            </div>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Amount</label>
+                            <input type="number" step="0.01" name="amount" class="input-group" value="<?php echo $trans ? $trans['amount'] : ''; ?>" required>
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Employee Name</label>
+                            <input type="text" name="employee_name" class="input-group" value="<?php echo $trans ? htmlspecialchars($trans['employee_name']) : ''; ?>" required>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Ordered By</label>
+                            <input type="text" name="ordered_by" class="input-group" value="<?php echo $trans ? htmlspecialchars($trans['ordered_by']) : ''; ?>" required>
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-slate-700 mb-1">Reason</label>
+                        <textarea name="reason" class="input-group" rows="3"><?php echo $trans ? htmlspecialchars($trans['reason']) : ''; ?></textarea>
+                    </div>
+                    
+                          <!-- Budget Status -->
+     
+                                            
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+                        <div class="bg-slate-100 p-4 rounded-lg">
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Remaining Monthly</label>
+                            <div class="text-xl font-bold text-slate-800" id="remaining_month">0.00</div>
+                        </div>
+                        
+                        <div class="bg-slate-100 p-4 rounded-lg">
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Remaining Quarterly</label>
+                            <div class="text-xl font-bold text-slate-800" id="remaining_quarter">0.00</div>
+                        </div>
+                        
+                        <div class="bg-slate-100 p-4 rounded-lg">
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Remaining Yearly</label>
+                            <div class="text-xl font-bold text-slate-800" id="remaining_year">0.00</div>
+                        </div>
+                    </div>
+                    
+                    <div class="flex space-x-4 mt-6">
+                        <button type="submit" class="btn-primary">
+                            <?php echo $trans ? 'Update' : 'Save'; ?>
+                        </button>
+                        <button type="button" class="btn-info" onclick="window.print()">
+                            <i class="fas fa-print mr-2"></i> Print
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Existing Transactions -->
+            <div class="bg-white rounded-xl p-6 card-hover">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-xl font-bold text-slate-800">Existing Transactions</h2>
+                </div>
+                
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm text-left text-slate-600">
+                        <thead class="text-xs uppercase bg-slate-100 text-slate-700">
+                            <tr>
+                                <th class="px-4 py-3">ID</th>
+                                <th class="px-4 py-3">Directorate/Programs</th>
+                                <th class="px-4 py-3">Budget Codes</th>
+                                <th class="px-4 py-3">Employee</th>
+                                <th class="px-4 py-3">Amount</th>
+                                <th class="px-4 py-3">Month</th>
+                                <th class="px-4 py-3">Quarter</th>
+                                <th class="px-4 py-3">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($transactions as $t): ?>
+                                <tr class="border-b border-slate-200 hover:bg-slate-50">
+                                    <td class="px-4 py-2 font-medium"><?php echo $t['id']; ?></td>
+                                    <td class="px-4 py-2"><?php echo htmlspecialchars($t['owner_code']); ?></td>
+                                    <td class="px-4 py-2"><?php echo htmlspecialchars($t['budget_code']); ?></td>
+                                    <td class="px-4 py-2"><?php echo htmlspecialchars($t['employee_name']); ?></td>
+                                    <td class="px-4 py-2 font-medium"><?php echo number_format($t['amount'], 2); ?> ETB</td>
+                                    <td class="px-4 py-2"><?php echo htmlspecialchars($t['et_month']); ?></td>
+                                    <td class="px-4 py-2"><?php echo $t['quarter']; ?></td>
+                                    <td class="px-4 py-2">
+                                        <div class="flex space-x-2">
+                                            <a href="?action=edit&id=<?php echo $t['id']; ?>" class="btn-secondary btn-sm">
+                                                <i class="fas fa-edit mr-1"></i> Edit
+                                            </a>
+                                            <a href="?action=delete&id=<?php echo $t['id']; ?>" class="btn-danger btn-sm" onclick="return confirm('Are you sure?')">
+                                                <i class="fas fa-trash mr-1"></i> Delete
+                                            </a>
+                                        </div>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const sidebar = document.getElementById('sidebar');
+            const mainContent = document.getElementById('mainContent');
+            const toggleBtn = document.getElementById('sidebarToggle');
+            
+            if (toggleBtn && sidebar) {
+                toggleBtn.addEventListener('click', () => {
+                    sidebar.classList.toggle('collapsed');
+                    mainContent.classList.toggle('expanded');
+                });
+            }
+            
+            // Load available budget on page load
+            loadAvailable();
+        });
+
+        function loadAvailable() {
+            const ownerId = document.querySelector('select[name="owner_id"]').value;
+            const codeId = document.querySelector('select[name="code_id"]').value;
+            const month = document.querySelector('select[name="et_month"]').value;
+
+            if (ownerId && codeId && month) {
+                fetch(`get_remaining.php?owner_id=${ownerId}&code_id=${codeId}&month=${encodeURIComponent(month)}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('remaining_month').textContent = data.remaining_month.toFixed(2);
+                        document.getElementById('remaining_quarter').textContent = data.remaining_quarter.toFixed(2);
+                        document.getElementById('remaining_year').textContent = data.remaining_year.toFixed(2);
+                    })
+                    .catch(error => console.error('Error:', error));
+            }
+        }
+
+        function updateQuarter() {
+            const month = document.getElementById('month').value;
+            const quarterMap = {
+                'ሐምሌ': 1, 'ነሐሴ': 1, 'መስከረም': 1,
+                'ጥቅምት': 2, 'ህዳር': 2, 'ታኅሳስ': 2,
+                'ጥር': 3, 'የካቲት': 3, 'መጋቢት': 3,
+                'ሚያዝያ': 4, 'ግንቦት': 4, 'ሰኔ': 4
+            };
+            document.getElementById('quarter_label').textContent = quarterMap[month] || 0;
+            loadAvailable();
+        }
+    </script>
+</body>
+</html>
+
+===========================
+my fuel_management page's code isset
+
+<?php
+session_start();
+include 'includes/db.php';
+include 'includes/functions.php';
+
+if (!isset($_SESSION['user_id'])) {
+    header('Location: index.php');
+    exit;
+}
+
+// Fetch dropdown data
+$owners      = $pdo->query("SELECT * FROM budget_owners")->fetchAll();
+$vehicles    = $pdo->query("SELECT * FROM vehicles")->fetchAll();
+$fuel_trans  = $pdo->query("
+    SELECT f.*, o.code AS owner_code
+      FROM fuel_transactions f
+      JOIN budget_owners o
+        ON f.owner_id = o.id
+")->fetchAll();
+
+// Last fuel price to prefill the form
+$last_price = $pdo
+    ->query("SELECT fuel_price FROM fuel_transactions ORDER BY date DESC LIMIT 1")
+    ->fetchColumn() ?: 0;
+
+// Editing existing record?
+$fuel = null;
+if (isset($_GET['action'], $_GET['id']) && $_GET['action'] === 'edit') {
+    $stmt = $pdo->prepare("SELECT * FROM fuel_transactions WHERE id = ?");
+    $stmt->execute([ $_GET['id'] ]);
+    $fuel = $stmt->fetch();
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $owner_id         = $_POST['owner_id'];
+    $driver_name      = $_POST['driver_name'];
+    $plate_number     = $_POST['plate_number'];
+    $et_month         = $_POST['et_month'];
+    $current_gauge    = (float)($_POST['current_gauge']    ?? 0);
+    $journey_distance = (float)($_POST['journey_distance'] ?? 0);
+    $fuel_price       = (float)($_POST['fuel_price']       ?? 0);
+    $refuelable_amt   = (float)($_POST['refuelable_amount']?? 0);
+    $total_amount     = (float)($_POST['total_amount']     ?? 0);
+    $new_gauge        = (float)($_POST['new_gauge']        ?? 0);
+    $gauge_gap        = (float)($_POST['gauge_gap']        ?? 0);
+
+    // Validate gauge progression
+    $stmt = $pdo->prepare("
+        SELECT new_gauge
+          FROM fuel_transactions
+         WHERE plate_number = ?
+         ORDER BY date DESC
+         LIMIT 1
+    ");
+    $stmt->execute([ $plate_number ]);
+    $last_new_gauge = (float)($stmt->fetchColumn() ?: 0);
+
+    if ($last_new_gauge && $current_gauge < $last_new_gauge) {
+        $_SESSION['message'] = 'Gauge error: Current gauge less than expected new gauge.';
+        $_SESSION['message_type'] = 'error';
+    } else {
+        $pdo->beginTransaction();
+        try {
+            // 1) Determine Ethiopian year and quarter from selected month
+            $year        = date('Y') - 8;
+            $quarterMap = [
+                'ሐምሌ'=>1,'ነሐሴ'=>1,'መስከረም'=>1,
+                'ጥቅምት'=>2,'ህዳር'=>2,'ታኅሳስ'=>2,
+                'ጥር'=>3,'የካቲት'=>3,'መጋቢት'=>3,
+                'ሚያዝያ'=>4,'ግንቦት'=>4,'ሰኔ'=>4
+            ];
+            $quarter = $quarterMap[$et_month] ?? 0;
+
+            // 2) Deduct from monthly budget if exists, else from yearly
+            $fuel_code_id = 5; // Sansii kee Sukutih
+            // Fetch monthly budget row
+            $stmt = $pdo->prepare("
+                SELECT * 
+                  FROM budgets
+                 WHERE owner_id   = ?
+                   AND code_id    = ?
+                   AND year       = ?
+                   AND month      = ?
+            ");
+            $stmt->execute([ $owner_id, $fuel_code_id, $year, $et_month ]);
+            $budget = $stmt->fetch();
+
+            if ($budget) {
+                // Use remaining_monthly field for fuel
+                $new_rem_month = $budget['remaining_monthly'] - $total_amount;
+                if ($new_rem_month < 0) {
+                    throw new Exception('Insufficient remaining monthly budget for fuel.');
+                }
+                $stmt = $pdo->prepare("
+                    UPDATE budgets
+                       SET remaining_monthly = ?
+                     WHERE id = ?
+                ");
+                $stmt->execute([ $new_rem_month, $budget['id'] ]);
+            } else {
+                // Fallback to yearly
+                $stmt = $pdo->prepare("
+                    SELECT *
+                      FROM budgets
+                     WHERE owner_id     = ?
+                       AND code_id      = ?
+                       AND year         = ?
+                       AND monthly_amount = 0
+                ");
+                $stmt->execute([ $owner_id, $fuel_code_id, $year ]);
+                $budget_yearly = $stmt->fetch();
+                if (! $budget_yearly) {
+                    throw new Exception('No fuel budget allocated.');
+                }
+                $new_rem_year = $budget_yearly['remaining_yearly'] - $total_amount;
+                if ($new_rem_year < 0) {
+                    throw new Exception('Insufficient remaining yearly budget for fuel.');
+                }
+                $stmt = $pdo->prepare("
+                    UPDATE budgets
+                       SET remaining_yearly = ?
+                     WHERE id = ?
+                ");
+                $stmt->execute([ $new_rem_year, $budget_yearly['id'] ]);
+            }
+
+            // 3) Insert or update fuel transaction
+            if (isset($_POST['id']) && $_POST['action'] == 'update') {
+                $stmt = $pdo->prepare("
+                    UPDATE fuel_transactions
+                       SET owner_id           = ?,
+                           driver_name        = ?,
+                           plate_number       = ?,
+                           et_month           = ?,
+                           previous_gauge     = ?,
+                           current_gauge      = ?,
+                           journey_distance   = ?,
+                           fuel_price         = ?,
+                           refuelable_amount  = ?,
+                           total_amount       = ?,
+                           new_gauge          = ?,
+                           gauge_gap          = ?
+                     WHERE id = ?
+                ");
+                $stmt->execute([
+                    $owner_id, $driver_name, $plate_number, $et_month,
+                    $last_new_gauge, $current_gauge, $journey_distance,
+                    $fuel_price, $refuelable_amt, $total_amount,
+                    $new_gauge, $gauge_gap, $_POST['id']
+                ]);
+                $_SESSION['message'] = 'Fuel transaction updated';
+            } else {
+                $stmt = $pdo->prepare("
+                    INSERT INTO fuel_transactions (
+                      owner_id,
+                      driver_name,
+                      plate_number,
+                      et_month,
+                      previous_gauge,
+                      current_gauge,
+                      journey_distance,
+                      fuel_price,
+                      refuelable_amount,
+                      total_amount,
+                      new_gauge,
+                      gauge_gap
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+                $stmt->execute([
+                    $owner_id, $driver_name, $plate_number, $et_month,
+                    $last_new_gauge, $current_gauge, $journey_distance,
+                    $fuel_price, $refuelable_amt, $total_amount,
+                    $new_gauge, $gauge_gap
+                ]);
+                $_SESSION['message'] = 'Fuel transaction added';
+            }
+
+            $pdo->commit();
+            $_SESSION['message_type'] = 'success';
+            
+            // PRG: Redirect after processing to avoid resubmit
+            header('Location: fuel_management.php');
+            exit;
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $_SESSION['message'] = 'Error: ' . $e->getMessage();
+            $_SESSION['message_type'] = 'error';
+        }
+    }
+}
+
+// Handle delete
+if (isset($_GET['action'], $_GET['id']) && $_GET['action'] === 'delete') {
+    $stmt = $pdo->prepare("DELETE FROM fuel_transactions WHERE id = ?");
+    $stmt->execute([ $_GET['id'] ]);
+    $_SESSION['message'] = 'Fuel transaction deleted';
+    $_SESSION['message_type'] = 'success';
+    header('Location: fuel_management.php');
+    exit;
+}
+
+// Clear message after displaying
+$message = $_SESSION['message'] ?? null;
+$message_type = $_SESSION['message_type'] ?? 'info';
+unset($_SESSION['message'], $_SESSION['message_type']);
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Fuel Management - Budget System</title>
+  <script src="css/tailwind.css"></script>
+  <link rel="stylesheet" href="css/all.min.css">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: '#4f46e5',
+            secondary: '#7c3aed',
+            light: '#f8fafc',
+            lighter: '#f1f5f9',
+            success: '#10B981',
+            error: '#EF4444',
+            warning: '#F59E0B',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    
+    .fade-out {
+      opacity: 1;
+      transition: opacity 0.5s ease-out;
+    }
+    
+    .fade-out.hide {
+      opacity: 0;
+    }
+    
+    .sidebar {
+      width: 280px;
+      transition: all 0.3s ease;
+    }
+    
+    .sidebar.collapsed {
+      margin-left: -280px;
+    }
+    
+    .main-content {
+      width: calc(100% - 280px);
+      transition: all 0.3s ease;
+    }
+    
+    .main-content.expanded {
+      width: 100%;
+    }
+    
+    @media (max-width: 768px) {
+      .sidebar {
+        position: fixed;
+        left: 0;
+        z-index: 1000;
+        height: 100vh;
+        overflow-y: auto;
+      }
+      
+      .main-content {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body class="text-slate-700 flex bg-gray-100 min-h-screen">
+  <!-- Sidebar -->
+  <div class="sidebar bg-gradient-to-b from-primary to-secondary text-white" id="sidebar">
+    <div class="p-5">
+      <div class="flex flex-col items-center justify-center mb-6">
+        <!-- Bureau Logo -->
+        <img src="images/bureau-logo.png" alt="Bureau Logo" class="bureau-logo bg-white p-2 rounded-lg w-40"
+             onerror="this.src='https://via.placeholder.com/180x60/4f46e5/ffffff?text=Bureau+Logo'">
+      </div>
+      <ul class="space-y-2">
+        <li>
+          <a href="dashboard.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+            <i class="fas fa-tachometer-alt w-5"></i>
+            <span class="ml-3">Dashboard</span>
+          </a>
+        </li>
+        <?php if ($_SESSION['role'] == 'admin'): ?>
+          <li>
+            <a href="budget_adding.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+              <i class="fas fa-plus-circle w-5"></i>
+              <span class="ml-3">Budget Adding</span>
+            </a>
+          </li>
+          <li>
+            <a href="settings_owners.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+              <i class="fas fa-building w-5"></i>
+              <span class="ml-3">Settings Owners</span>
+            </a>
+          </li>
+          <li>
+            <a href="settings_codes.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+              <i class="fas fa-code w-5"></i>
+              <span class="ml-3">Settings Codes</span>
+            </a>
+          </li>
+          <li>
+            <a href="settings_vehicles.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+              <i class="fas fa-car w-5"></i>
+              <span class="ml-3">Settings Vehicles</span>
+            </a>
+          </li>
+        <?php endif; ?>
+        <li>
+          <a href="transaction.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+            <i class="fas fa-exchange-alt w-5"></i>
+            <span class="ml-3">Transaction</span>
+          </a>
+        </li>
+        <li>
+          <a href="fuel_management.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white bg-white/20">
+            <i class="fas fa-gas-pump w-5"></i>
+            <span class="ml-3">Fuel Management</span>
+          </a>
+        </li>
+        <li>
+                    <a href="perdium.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white bg-white/20">
+                        <i class="fas fa-dollar-sign w-5"></i>
+                        <span class="ml-3">Perdium Management</span>
+                    </a>
+                </li>
+        <li>
+          <a href="users_management.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+            <i class="fas fa-users w-5"></i>
+            <span class="ml-3">Users Management</span>
+          </a>
+        </li>
+        <li>
+          <a href="logout.php" class="flex items-center p-3 text-base font-normal rounded-lg text-white/80 hover:bg-white/10">
+            <i class="fas fa-sign-out-alt w-5"></i>
+            <span class="ml-3">Logout</span>
+          </a>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Main Content -->
+  <div class="main-content" id="mainContent">
+    <div class="p-6">
+      <!-- Header -->
+      <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 p-6 bg-white rounded-xl shadow-sm">
+        <div>
+          <h1 class="text-2xl md:text-3xl font-bold text-slate-800">
+            Fuel Management
+          </h1>
+          <p class="text-slate-600 mt-2">Manage fuel transactions and consumption</p>
+        </div>
+        <div class="flex items-center space-x-4 mt-4 md:mt-0">
+          <button class="bg-slate-200 hover:bg-slate-300 text-slate-700 p-2 rounded-lg md:hidden shadow-sm" id="sidebarToggle">
+            <i class="fas fa-bars"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Message Notification -->
+      <?php if ($message): ?>
+        <div id="message" class="fade-out mb-6 p-4 rounded-lg <?php 
+          echo $message_type == 'error' ? 'bg-error/20 text-error' : 
+               ($message_type == 'success' ? 'bg-success/20 text-success' : 
+               'bg-primary/20 text-primary');
+        ?>">
+          <div class="flex justify-between items-center">
+            <p><?php echo htmlspecialchars($message); ?></p>
+            <button onclick="document.getElementById('message').classList.add('hide')" class="text-lg">&times;</button>
+          </div>
+        </div>
+        
+        <script>
+          // Auto-hide message after 5 seconds
+          setTimeout(function() {
+            const message = document.getElementById('message');
+            if (message) {
+              message.classList.add('hide');
+              setTimeout(() => message.remove(), 500);
+            }
+          }, 5000);
+        </script>
+      <?php endif; ?>
+
+      <!-- Fuel Transaction Form -->
+      <div class="bg-white rounded-xl p-6 shadow-sm mb-8">
+        <h2 class="text-xl font-bold text-slate-800 mb-6">
+          <?php echo isset($fuel) ? 'Edit Fuel Transaction' : 'Add New Fuel Transaction'; ?>
+        </h2>
+        <form id="fuelForm" method="POST" class="space-y-4">
+          <?php if (isset($fuel)): ?>
+            <input type="hidden" name="id" value="<?php echo $fuel['id']; ?>">
+            <input type="hidden" name="action" value="update">
+          <?php endif; ?>
+          
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Budget Owner *</label>
+              <select name="owner_id" id="owner_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" onchange="loadFuelRemaining()">
+                <option value="">Select Owner</option>
+                <?php foreach ($owners as $o): ?>
+                  <option value="<?php echo $o['id']; ?>" <?php echo (isset($fuel) && $fuel['owner_id'] == $o['id']) || (isset($_POST['owner_id']) && $_POST['owner_id'] == $o['id']) ? 'selected' : ''; ?>>
+                    <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Driver Name *</label>
+              <input type="text" name="driver_name" value="<?php echo isset($fuel) ? htmlspecialchars($fuel['driver_name']) : (isset($_POST['driver_name']) ? htmlspecialchars($_POST['driver_name']) : ''); ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Plate Number *</label>
+              <select name="plate_number" id="plate_number" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" onchange="fetchLastGauge(this.value)">
+                <option value="">Select Vehicle</option>
+                <?php foreach ($vehicles as $v): ?>
+                  <option value="<?php echo $v['plate_no']; ?>" <?php echo (isset($fuel) && $fuel['plate_number'] == $v['plate_no']) || (isset($_POST['plate_number']) && $_POST['plate_number'] == $v['plate_no']) ? 'selected' : ''; ?>>
+                    <?php echo htmlspecialchars($v['plate_no'] . ' - ' . $v['model']); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Ethiopian Month *</label>
+              <select name="et_month" id="et_month" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" onchange="loadFuelRemaining()">
+                <option value="">Select Month</option>
+                <option value="መስከረም" <?php echo (isset($fuel) && $fuel['et_month'] == 'መስከረም') || (isset($_POST['et_month']) && $_POST['et_month'] == 'መስከረም') ? 'selected' : ''; ?>>መስከረም</option>
+                <option value="ጥቅምት" <?php echo (isset($fuel) && $fuel['et_month'] == 'ጥቅምት') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ጥቅምት') ? 'selected' : ''; ?>>ጥቅምት</option>
+                <option value="ህዳር" <?php echo (isset($fuel) && $fuel['et_month'] == 'ህዳር') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ህዳር') ? 'selected' : ''; ?>>ህዳር</option>
+                <option value="ታኅሳስ" <?php echo (isset($fuel) && $fuel['et_month'] == 'ታኅሳስ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ታኅሳስ') ? 'selected' : ''; ?>>ታኅሳስ</option>
+                <option value="ጥር" <?php echo (isset($fuel) && $fuel['et_month'] == 'ጥር') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ጥር') ? 'selected' : ''; ?>>ጥር</option>
+                <option value="የካቲት" <?php echo (isset($fuel) && $fuel['et_month'] == 'የካቲቷ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'የካቲቷ') ? 'selected' : ''; ?>>የካቲቷ</option>
+                <option value="መጋቢት" <?php echo (isset($fuel) && $fuel['et_month'] == 'መጋቢቷ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'መጋቢቷ') ? 'selected' : ''; ?>>መጋቢቷ</option>
+                <option value="ሚያዝያ" <?php echo (isset($fuel) && $fuel['et_month'] == 'ሚያዝያ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ሚያዝያ') ? 'selected' : ''; ?>>ሚያዝያ</option>
+                <option value="ግንቦት" <?php echo (isset($fuel) && $fuel['et_month'] == 'ግንቦቷ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ግንቦቷ') ? 'selected' : ''; ?>>ግንቦት</option>
+                <option value="ሰኔ" <?php echo (isset($fuel) && $fuel['et_month'] == 'ሰኔ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ሰኔ') ? 'selected' : ''; ?>>ሰኔ</option>
+                <option value="ሐምሌ" <?php echo (isset($fuel) && $fuel['et_month'] == 'ሐምሌ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ሐምሌ') ? 'selected' : ''; ?>>ሐምሌ</option>
+                <option value="ነሐሴ" <?php echo (isset($fuel) && $fuel['et_month'] == 'ነሐሴ') || (isset($_POST['et_month']) && $_POST['et_month'] == 'ነሐሴ') ? 'selected' : ''; ?>>ነሐሴ</option>
+              </select>
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Current Gauge *</label>
+              <input type="number" step="0.01" name="current_gauge" id="current" value="<?php echo isset($fuel) ? $fuel['current_gauge'] : (isset($_POST['current_gauge']) ? $_POST['current_gauge'] : ''); ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" oninput="calculateFuel()">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Journey Distance (km) *</label>
+              <input type="number" step="0.01" name="journey_distance" id="journey" value="<?php echo isset($fuel) ? $fuel['journey_distance'] : (isset($_POST['journey_distance']) ? $_POST['journey_distance'] : ''); ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" oninput="calculateFuel()">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Fuel Price (per liter) *</label>
+              <input type="number" step="0.01" name="fuel_price" id="price" value="<?php echo isset($fuel) ? $fuel['fuel_price'] : (isset($_POST['fuel_price']) ? $_POST['fuel_price'] : $last_price); ?>" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" oninput="calculateFuel()">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Refuelable Amount (liters)</label>
+              <input type="number" step="0.01" name="refuelable_amount" id="refuelable" readonly class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Total Amount</label>
+              <input type="number" step="0.01" name="total_amount" id="total" readonly class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">New Gauge</label>
+              <input type="number" step="0.01" name="new_gauge" id="new_gauge" readonly class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100">
+            </div>
+            
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Gauge Gap</label>
+              <input type="number" step="0.01" name="gauge_gap" id="gap" readonly class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100">
+            </div>
+          </div>
+          
+          <div class="flex justify-end space-x-4 pt-4">
+            <?php if (isset($fuel)): ?>
+              <a href="fuel_management.php" class="px-4 py-2 bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-500">
+                Cancel
+              </a>
+            <?php endif; ?>
+            <button type="submit" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-primary">
+              <?php echo isset($fuel) ? 'Update Transaction' : 'Add Transaction'; ?>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Budget Status -->
+      <div class="bg-white rounded-xl p-6 shadow-sm mb-8">
+        <h2 class="text-xl font-bold text-slate-800 mb-6">Budget Status</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div class="bg-blue-50 p-4 rounded-lg">
+            <h3 class="text-sm font-medium text-blue-800">Monthly Remaining</h3>
+            <p class="text-2xl font-bold text-blue-800" id="rem_monthly">0.00</p>
+          </div>
+          <div class="bg-green-50 p-4 rounded-lg">
+            <h3 class="text-sm font-medium text-green-800">Quarterly Remaining</h3>
+            <p class="text-2xl font-bold text-green-600" id="rem_quarterly">0.00</p>
+          </div>
+          <div class="bg-purple-50 p-4 rounded-lg">
+            <h3 class="text-sm font-medium text-purple-800">Yearly Remaining</h3>
+            <p class="text-2xl font-bold text-purple-800" id="rem_yearly">0.00</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Generate Fuel Report -->
+      <div class="bg-white rounded-xl p-6 shadow-sm mb-8">
+        <h2 class="text-xl font-bold text-slate-800 mb-6">Generate Fuel Report</h2>
+        <form action="reports/fuel_transaction_report.php" method="GET" target="_blank" class="space-y-4">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Start Date</label>
+              <input type="date" name="start_date" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" value="<?php echo date('Y-m-01'); ?>">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">End Date</label>
+              <input type="date" name="end_date" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" value="<?php echo date('Y-m-t'); ?>">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Budget Owner</label>
+              <select name="owner_id" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
+                <option value="">All Owners</option>
+                <?php foreach ($owners as $o): ?>
+                  <option value="<?php echo $o['id']; ?>">
+                    <?php echo htmlspecialchars($o['code'] . ' - ' . $o['name']); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+          </div>
+          <div class="flex space-x-4">
+            <button type="submit" name="format" value="html" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-primary">
+              <i class="fas fa-file-alt mr-2"></i> View HTML Report
+            </button>
+            <button type="submit" name="format" value="pdf" class="px-4 py-2 bg-secondary text-white rounded-md hover:bg-secondary-dark focus:outline-none focus:ring-2 focus:ring-secondary">
+              <i class="fas fa-file-pdf mr-2"></i> Download PDF
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Fuel Transactions Table -->
+      <div class="bg-white rounded-xl p-6 shadow-sm">
+        <h2 class="text-xl font-bold text-slate-800 mb-6">Fuel Transactions</h2>
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+              <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Owner</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Driver</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Plate No</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Month</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Amount</th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+              </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200" id="transactionsTable">
+              <?php if (empty($fuel_trans)): ?>
+                <tr>
+                  <td colspan="7" class="px-4 py-4 text-center text-sm text-gray-500">
+                    No fuel transactions found.
+                  </td>
+                </tr>
+              <?php else: ?>
+                <?php foreach ($fuel_trans as $f): ?>
+                  <tr>
+                    <td class="px-4 py-4 text-sm text-gray-900"><?php echo date('M j, Y', strtotime($f['date'])); ?></td>
+                    <td class="px-4 py-4 text-sm text-gray-900"><?php echo htmlspecialchars($f['owner_code']); ?></td>
+                    <td class="px-4 py-4 text-sm text-gray-900"><?php echo htmlspecialchars($f['driver_name']); ?></td>
+                    <td class="px-4 py-4 text-sm text-gray-900"><?php echo htmlspecialchars($f['plate_number']); ?></td>
+                    <td class="px-4 py-4 text-sm text-gray-900"><?php echo htmlspecialchars($f['et_month']); ?></td>
+                    <td class="px-4 py-4 text-sm text-gray-900"><?php echo number_format($f['total_amount'], 2); ?></td>
+                    <td class="px-4 py-4 text-sm">
+                      <div class="flex space-x-2">
+                        <a href="?action=edit&id=<?php echo $f['id']; ?>" class="px-3 py-1 bg-blue-100 text-blue-700 rounded-md hover:bg-blue-200">
+                          <i class="fas fa-edit mr-1"></i> Edit
+                        </a>
+                        <a href="reports/fuel_transaction_report.php?id=<?php echo $f['id']; ?>" class="px-3 py-1 bg-green-100 text-green-700 rounded-md hover:bg-green-200" target="_blank">
+                          <i class="fas fa-print mr-1"></i> Print
+                          </a>
+                          
+                        
+                        
+                        <a href="?action=delete&id=<?php echo $f['id']; ?>" class="px-3 py-1 bg-red-100 text-red-700 rounded-md hover:bg-red-200" onclick="return confirm('Are you sure you want to delete this transaction?')">
+                          <i class="fas fa-trash mr-1"></i> Delete
+                        </a>
+                      </div>
+                    </td>
+                  </tr>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+ <!-- <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script> -->
+    
+    <script src="js/jquery-3.7.1.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const sidebar = document.getElementById('sidebar');
+      const mainContent = document.getElementById('mainContent');
+      const toggleBtn = document.getElementById('sidebarToggle');
+      
+      if (toggleBtn && sidebar) {
+        toggleBtn.addEventListener('click', () => {
+          sidebar.classList.toggle('collapsed');
+          mainContent.classList.toggle('expanded');
+        });
+      }
+      
+      // Initialize any necessary functionality
+      calculateFuel();
+    });
+
+    // Fetch last gauge for selected plate
+    function fetchLastGauge(plate) {
+      if (!plate) return;
+      $.get('get_last_gauge.php', { plate_number: plate }, data => {
+        const resp = JSON.parse(data);
+        document.getElementById('current').value = resp.last_gauge || 0;
+        calculateFuel();
+      });
+    }
+
+    // Calculate liters & cost & gauges
+    function calculateFuel() {
+      const current = parseFloat(document.getElementById('current').value) || 0;
+      const journey = parseFloat(document.getElementById('journey').value)   || 0;
+      const price   = parseFloat(document.getElementById('price').value)     || 0;
+
+      // your business logic (e.g. 5 km per liter)
+      const refuel = journey / 5;
+      const total  = refuel * price;
+      const newG   = current + journey;
+      const gap    = newG - current;
+
+      document.getElementById('refuelable').value = refuel.toFixed(2);
+      document.getElementById('total').value      = total.toFixed(2);
+      document.getElementById('new_gauge').value  = newG.toFixed(2);
+      document.getElementById('gap').value        = gap.toFixed(2);
+    }
+
+    // Load remaining budgets via AJAX
+    function loadFuelRemaining() {
+      const ownerId = document.getElementById('owner_id').value;
+      const etMonth = document.getElementById('et_month').value;
+      const codeId  = 5; // fuel code
+
+      if (!ownerId || !etMonth) return;
+
+      fetch(`get_remaining.php?owner_id=${ownerId}&code_id=${codeId}&month=${encodeURIComponent(etMonth)}`)
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('rem_monthly').textContent   = parseFloat(data.remaining_month || 0).toFixed(2);
+          document.getElementById('rem_quarterly').textContent = parseFloat(data.remaining_quarter || 0).toFixed(2);
+          document.getElementById('rem_yearly').textContent    = parseFloat(data.remaining_year || 0).toFixed(2);
+        })
+        .catch(console.error);
+    }
+
+    // AJAX form submission to avoid page reload
+    $(document).ready(function() {
+      $('#fuelForm').on('submit', function(e) {
+        e.preventDefault();
+        
+        const formData = $(this).serialize();
+        const formAction = $(this).attr('action') || window.location.href;
+        const formMethod = $(this).attr('method') || 'POST';
+        
+        $.ajax({
+          url: formAction,
+          type: formMethod,
+          data: formData,
+          success: function(response) {
+            // Show success message
+            $('#message').remove();
+            $('.main-content > .p-6').prepend(
+              '<div id="message" class="fade-out mb-6 p-4 rounded-lg bg-success/20 text-success">' +
+                '<div class="flex justify-between items-center">' +
+                  '<p>Transaction saved successfully</p>' +
+                  '<button onclick="document.getElementById(\'message\').classList.add(\'hide\')" class="text-lg">&times;</button>' +
+                '</div>' +
+              '</div>'
+            );
+            
+            // Auto-hide message
+            setTimeout(function() {
+              $('#message').addClass('hide');
+              setTimeout(() => $('#message').remove(), 500);
+            }, 5000);
+            
+            // Reload the transactions table only
+            $.get('get_fuel_transactions.php', function(data) {
+              $('#transactionsTable').html(data);
+            });
+            
+            // Reset form if not in edit mode
+            if (!$('input[name="id"]').length) {
+              $('#fuelForm')[0].reset();
+              calculateFuel();
+            }
+          },
+          error: function(xhr, status, error) {
+            // Show error message
+            $('#message').remove();
+            $('.main-content > .p-6').prepend(
+              '<div id="message" class="fade-out mb-6 p-4 rounded-lg bg-error/20 text-error">' +
+                '<div class="flex justify-between items-center">' +
+                  '<p>Error: ' + xhr.responseText + '</p>' +
+                  '<button onclick="document.getElementById(\'message\').classList.add(\'hide\')" class="text-lg">&times;</button>' +
+                '</div>' +
+              '</div>'
+            );
+          }
+        });
+      });
+    });
+  </script>
+</body>
+</html>
+
+=============
+
+my get_remaining.php code is 
+
+<?php
+include 'includes/db.php';
+
+// Get parameters
+$owner_id = $_GET['owner_id'] ?? null;
+$code_id  = $_GET['code_id'] ?? null;
+$month    = $_GET['month'] ?? null;
+$year     = date('Y') - 8; // Ethiopian fiscal year
+
+// Ethiopian month to quarter mapping
+$quarterMap = [
+    'ሐምሌ'     => 1, 'ነሐሴ'   => 1, 'መስከረም' => 1,
+    'ጥቅምት'   => 2, 'ህዳር'   => 2, 'ታኅሳስ'   => 2,
+    'ጥር'       => 3, 'የካቲቷ' => 3, 'መጋቢቷ' => 3,
+    'ሚያዝያ'   => 4, 'ግንቦቷ' => 4, 'ሰኔ'     => 4,
+];
+$quarter = $quarterMap[$month] ?? 0;
+
+// Initialize response
+$response = [
+    'remaining_month'   => 0,
+    'remaining_quarter' => 0,
+    'remaining_year'    => 0
+];
+
+// Proceed only if all required parameters are present
+if ($owner_id && $code_id && $month) {
+    // Fetch monthly budget row
+    $stmt = $pdo->prepare("
+        SELECT remaining_monthly, remaining_yearly
+          FROM budgets
+         WHERE owner_id = ?
+           AND code_id  = ?
+           AND year     = ?
+           AND month    = ?
+         ORDER BY id DESC
+         LIMIT 1
+    ");
+    $stmt->execute([$owner_id, $code_id, $year, $month]);
+    $monthly_budget = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($monthly_budget) {
+        $response['remaining_month'] = (float)$monthly_budget['remaining_monthly'];
+        $response['remaining_year']  = (float)$monthly_budget['remaining_yearly'];
+    }
+
+    // Fetch quarterly budget by summing actual monthly allocations
+    if ($quarter) {
+        $stmt = $pdo->prepare("
+            SELECT SUM(remaining_monthly) AS total_quarter
+              FROM budgets
+             WHERE owner_id = ?
+               AND code_id  = ?
+               AND year     = ?
+               AND quarter  = ?
+               AND monthly_amount > 0
+        ");
+        $stmt->execute([$owner_id, $code_id, $year, $quarter]);
+        $quarter_sum = $stmt->fetchColumn();
+        $response['remaining_quarter'] = (float)$quarter_sum;
+    }
+}
+
+// Return JSON response
+echo json_encode($response);
+
+===========
+my get_available.php code 
+
+<?php
+include 'includes/db.php';
+include 'includes/functions.php';
+
+$owner_id = $_GET['owner_id'] ?? null;
+$code_id = $_GET['code_id'] ?? null;
+$et_month = $_GET['et_month'] ?? null;
+if (!$owner_id || !$code_id || !$et_month) {
+    echo json_encode(['error' => 'Missing parameters']);
+    exit;
+}
+
+$quarterMap = [
+    'ሐምሌ' => 1, 'ነሐሴ' => 1, 'መስከረም' => 1,
+    'ጥቅምት' => 2, 'ህዳር' => 2, 'ታኅሳስ' => 2,
+    'ጥር' => 3, 'የካቲቷ' => 3, 'መጋቢቷ' => 3,
+    'ሚያዝያ' => 4, 'ግንቦቷ' => 4, 'ሰኔ' => 4,
+];
+$quarter = $quarterMap[$et_month] ?? 0;
+$year = date('Y') - 8;
+
+$stmt = $pdo->prepare("SELECT yearly_amount FROM budgets WHERE owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0");
+$stmt->execute([$owner_id, $code_id, $year]);
+$yearly_amount = $stmt->fetchColumn() ?: 0;
+$stmt = $pdo->prepare("SELECT SUM(amount) FROM transactions WHERE owner_id = ? AND code_id = ? AND YEAR(date) = ?");
+$stmt->execute([$owner_id, $code_id, date('Y')]);
+$trans_year = $stmt->fetchColumn() ?: 0;
+$remaining_year = $yearly_amount - $trans_year;
+
+$months_in_quarter = array_keys(array_filter($quarterMap, fn($q) => $q == $quarter));
+$stmt = $pdo->prepare("SELECT SUM(monthly_amount) FROM budgets WHERE owner_id = ? AND code_id = ? AND year = ? AND quarter = ?");
+$stmt->execute([$owner_id, $code_id, $year, $quarter]);
+$quarterly_alloc = $stmt->fetchColumn() ?: 0;
+$stmt = $pdo->prepare("SELECT SUM(amount) FROM transactions WHERE owner_id = ? AND code_id = ? AND quarter = ?");
+$stmt->execute([$owner_id, $code_id, $quarter]);
+$trans_quarter = $stmt->fetchColumn() ?: 0;
+$remaining_quarter = $quarterly_alloc - $trans_quarter;
+
+$stmt = $pdo->prepare("SELECT monthly_amount FROM budgets WHERE owner_id = ? AND code_id = ? AND month = ? AND year = ?");
+$stmt->execute([$owner_id, $code_id, $et_month, $year]);
+$monthly_amount = $stmt->fetchColumn() ?: 0;
+$stmt = $pdo->prepare("SELECT SUM(amount) FROM transactions WHERE owner_id = ? AND code_id = ? AND et_month = ?");
+$stmt->execute([$owner_id, $code_id, $et_month]);
+$trans_month = $stmt->fetchColumn() ?: 0;
+$remaining_month = $monthly_amount - $trans_month;
+
+echo json_encode([
+    'monthly' => number_format($remaining_month, 2),
+    'quarterly' => number_format($remaining_quarter, 2),
+    'yearly' => number_format($remaining_year, 2)
+]);
+?>
+
+=========
+my /includes/functions.php pages code is as follows
+
+
+<?php
+
+function fetchBudgets($pdo) {
+      return $pdo->query("SELECT ...")->fetchAll();
+  }
+  
+function getEtMonthAndQuarter($gregDate) {
+    $quarterMap = [
+        'ሐምሌ' => 1, 'ነሐሴ' => 1, 'መስከረም' => 1,
+        'ጥቅምት' => 2, 'ህዳር' => 2, 'ታኅሳስ' => 2,
+        'ጥር' => 3, 'የካቲቷ' => 3, 'መጋቢቷ' => 3,
+        'ሚያዝያ' => 4, 'ግንቦቷ' => 4, 'ሰኔ' => 4,
+    ];
+    $date = new DateTime($gregDate);
+    $month = (int)$date->format('m');
+    $day = (int)$date->format('d');
+    $etMonth = 'Unknown';
+
+    if (($month == 7 && $day >= 8) || ($month == 8 && $day <= 6)) $etMonth = 'ሐምሌ';
+    else if (($month == 8 && $day >= 7) || ($month == 9 && $day <= 5)) $etMonth = 'ነሐሴ';
+    else if (($month == 9 && $day >= 6 && $day <= 10)) $etMonth = 'መስከረም';
+    else if (($month == 9 && $day >= 11) || ($month == 10 && $day <= 10)) $etMonth = 'መስከረም';
+    else if (($month == 10 && $day >= 11) || ($month == 11 && $day <= 9)) $etMonth = 'ጥቅምት';
+    else if (($month == 11 && $day >= 10) || ($month == 12 && $day <= 9)) $etMonth = 'ህዳር';
+    else if (($month == 12 && $day >= 10) || ($month == 1 && $day <= 8)) $etMonth = 'ታኅሳስ';
+    else if (($month == 1 && $day >= 9) || ($month == 2 && $day <= 7)) $etMonth = 'ጥር';
+    else if (($month == 2 && $day >= 8) || ($month == 3 && $day <= 9)) $etMonth = 'የካቲቷ';
+    else if (($month == 3 && $day >= 10) || ($month == 4 && $day <= 8)) $etMonth = 'መጋቢቷ';
+    else if (($month == 4 && $day >= 9) || ($month == 5 && $day <= 8)) $etMonth = 'ሚያዝያ';
+    else if (($month == 5 && $day >= 9) || ($month == 6 && $day <= 7)) $etMonth = 'ግንቦቷ';
+    else if (($month == 6 && $day >= 8) || ($month == 7 && $day <= 7)) $etMonth = 'ሰኔ';
+
+    return ['etMonth' => $etMonth, 'quarter' => $quarterMap[$etMonth] ?? 0];
+}
+
+function get_current_ethiopian_month() {
+    $ethiopian_months = [
+        'መስከረም', 'ጥቅምት', 'ህዳር', 'ታኅሳስ', 
+        'ጥር', 'የካቲት', 'መጋቢት', 'ሚያዝያ', 
+        'ግንቦት', 'ሰኔ', 'ሐምሌ', 'ነሐሴ'
+    ];
+    
+    // This is a simplified calculation - you might need a more accurate Ethiopian calendar implementation
+    $month_index = (date('m') + 7) % 12;
+    return $ethiopian_months[$month_index];
+}
+
+$quarterMap = [
+    'ሐምሌ' => 1, 'ነሐሴ' => 1, 'መስከረም' => 1,
+    'ጥቅምት' => 2, 'ህዳር' => 2, 'ታኅሳስ' => 2,
+    'ጥር' => 3, 'የካቲቷ' => 3, 'መጋቢቷ' => 3,
+    'ሚያዝያ' => 4, 'ግንቦቷ' => 4, 'ሰኔ' => 4,
+];
+
+$etMonths = array_keys($quarterMap);
+?>
+
+============
+
+==========
+my budget_db database's all tables structure is as follows
+
+===Database budget_db
+
+== Table structure for table budgets
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|owner_id|int(11)|Yes|NULL
+|code_id|int(11)|Yes|NULL
+|adding_date|datetime|Yes|CURRENT_TIMESTAMP
+|year|int(11)|Yes|NULL
+|yearly_amount|decimal(15,2)|Yes|0.00
+|month|varchar(20)|Yes|NULL
+|monthly_amount|decimal(15,2)|Yes|0.00
+|quarter|int(11)|Yes|NULL
+|remaining_yearly|decimal(15,2)|Yes|0.00
+|remaining_monthly|decimal(15,2)|Yes|0.00
+|remaining_quarterly|decimal(15,2)|Yes|0.00
+== Dumping data for table budgets
+
+|29|5|5|2025-08-22 00:00:00|2017|35000.00| |0.00|0|3000.00|0.00|0.00
+|30|5|5|2025-08-22 00:00:00|2017|0.00|ሐምሌ|15000.00|1|20000.00|400.00|45000.00
+|31|6|5|2025-08-22 00:00:00|2017|40000.00| |0.00|0|0.00|0.00|0.00
+|32|6|5|2025-08-22 00:00:00|2017|0.00|ሐምሌ|30000.00|1|10000.00|0.00|90000.00
+|33|5|5|2025-08-22 00:00:00|2017|0.00|ሐምሌ|10000.00|1|10000.00|10000.00|30000.00
+|34|7|5|2025-08-25 00:00:00|2017|100000.00| |0.00|0|87000.00|0.00|0.00
+|35|7|5|2025-08-25 00:00:00|2017|0.00|ሐምሌ|13000.00|1|87000.00|2680.00|39000.00
+|36|24|5|2025-08-25 00:00:00|2017|15000.00| |0.00|0|15000.00|0.00|0.00
+|37|6|5|2025-08-29 00:00:00|2017|0.00|ነሐሴ|10000.00|1|0.00|10000.00|30000.00
+|38|5|6|2025-08-31 00:00:00|2017|150000.00| |0.00|0|105000.00|0.00|0.00
+|39|5|6|2025-08-31 00:00:00|2017|0.00|ነሐሴ|15000.00|1|135000.00|2675.20|45000.00
+|40|5|6|2025-09-01 00:00:00|2017|0.00|መስከረም|30000.00|1|105000.00|12189.60|90000.00
+|41|6|6|2025-09-02 00:00:00|2017|200000.00| |0.00|0|180000.00|0.00|0.00
+|42|6|6|2025-09-02 00:00:00|2017|0.00|ነሐሴ|20000.00|1|180000.00|18311.80|60000.00
+|43|5|5|2025-09-02 00:00:00|2017|0.00|መስከረም|7000.00|1|3000.00|6400.00|21000.00
+|44|10|10|2025-09-02 00:00:00|2017|12000.00| |0.00|0|10800.00|0.00|0.00
+|45|10|10|2025-09-02 00:00:00|2017|0.00|ሐምሌ|1200.00|1|10800.00|1200.00|3600.00
+== Table structure for table budget_codes
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|**code**|varchar(10)|Yes|NULL
+|name|varchar(100)|Yes|NULL
+== Dumping data for table budget_codes
+
+|5|6217|Sansii kee Sukutih
+|6|6231|Ayroh Assentah
+|7|6232|Transporti Mekláh
+|8|6233|Qibni Cadih
+|9|6251|Anbalaal Takke Mihrat Afaafayitte
+|10|6252|Kiráh
+|11|6253|Maysaxxgáh
+|12|6254|Inshuransih
+|13|6255|Quukah
+|14|6256|Afaafay Meklaalih
+|15|6257|Kooraan Afaafayih Meklah
+|16|6258|Telefoon Afaafay Meklah
+|17|6259|Leey, Postaa kee Gersi Afaafayih Meklaali
+|18|6271|Baaxoh Addah Aydkaakanáh
+|19|6419|Baxa baxsa Meklaalih
+== Table structure for table budget_owners
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|**code**|varchar(10)|Yes|NULL
+|name|varchar(100)|Yes|NULL
+== Dumping data for table budget_owners
+
+|5|01|ዋና ቢሮ ሐላፊ
+|6|02|የበሽታ መከላከልና መቆጣጠር ዘርፍ ም/ቢ/ሐላፊ
+|7|03|የኦፕሬሽን ዘርፍ ም/ቢ/ሐላፊ
+|8|04|የጤናና ጤና ነክ አገልግሎቶች ም/ቢ/ሐላፊ
+|9|05|የበሽታ መከላከልና መቆጣጠር ዳያሬክቶሬት
+|10|06|የኢንፎርሜሽን ኮሙኒኬሽን ቴክኖሎጂ ዳይሬክቶሬት
+|11|07|የክሊኒካል አገልግሎት ዳያሬክቶሬት
+|12|08|የግዥ፣ ፋይናንስና ንብረት አስተዳደር ዳይሬክቶሬት
+|13|09|የእቅድ ዝግጅት፣ ክትትልና ግምገማ  ዳይሬክቶሬት
+|14|10|የኮሙዩኒኬሽን ጉዳዮች ዳይሬክቶሬት
+|15|11|የእናቶች ፤ ህፃናት አፍላ ወጣቶች እና አገልግሎት ዳያሬክቶሬት
+|16|12|የማህበረሰበ ተሳትፎና የመጀመርያ ደረጃ ጤና እንክብካቤ ዳይሬክቶሬት
+|17|13|የሥርአተ ምግብ ማስተባበርያ ዳይሬክቶሬት
+|18|14|የሴቶች ማህበራዊ ጉዳዮች አካቶ ትግበራ ዳይሬክቶሬት
+|19|15|የህክምና ግብዓቶች አቅርቦትና የፋርማሲ አገልግሎት ዳይሬክቶሬት
+|20|16|የውስጥ የኦዲት ዳይሬክቶሬት
+|21|17|የጤናና ጤና ነክ አገልግሎቶች ብቃትና ጥራት ማረጋገጥ ዳይሬክቶሬት
+|22|18|የሰው ሀብት ልማትና መልካም አስተዳደር ዳይሬክቶሬት
+|23|NULL|SDG Pool Fund
+|24|NULL|UNDAF
+|25|NULL|World Bank
+|26|NULL|Health Emergency
+|27|NULL|GAVI
+|28|NULL|African CDC
+|29|NULL|Afar Essential
+|30|NULL|Teradeo
+|31|NULL|Wash
+|32|NULL|EU
+|33|NULL|Global Fund
+|34|NULL|Grant Pool Fund
+|35|NULL|CDC COOP
+|36|NULL|Human Capital
+== Table structure for table cities
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|name_amharic|varchar(255)|No|
+|name_english|varchar(255)|No|
+|rate_low|decimal(10,2)|No|
+|rate_medium|decimal(10,2)|No|
+|rate_high|decimal(10,2)|No|
+== Dumping data for table cities
+
+|1|መቀሌ|Mekele|348.00|395.00|468.00
+|2|ሰመራ|Semera|315.00|361.00|413.00
+|3|ባህርዳር|Bahir Dar|344.00|390.00|462.00
+|4|አሶሳ|Assosa|328.00|367.00|416.00
+|5|ጅግጅጋ|Jijiga|314.00|353.00|404.00
+|6|ጋምቤላ|Gambela|327.00|367.00|419.00
+|7|ሀረር|Harar|365.00|407.00|465.00
+|8|ሀዋሳ|Hawassa|359.00|405.00|477.00
+|9|አዲስ አበባ|Addis Ababa|468.00|549.00|724.00
+|10|ድሬደዋ|Dire Dawa|367.00|408.00|465.00
+|11|አዳማ|Adama|353.00|396.00|459.00
+== Table structure for table employees
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|name|varchar(255)|No|
+|salary|decimal(10,2)|No|
+|directorate|varchar(255)|No|
+|photo|varchar(255)|Yes|NULL
+|created_at|timestamp|No|CURRENT_TIMESTAMP
+== Dumping data for table employees
+
+|1|Ali Abdela|11305.00|06 - ኢንፎርሜሽን ኮሙኒኬሽን ቴክኖሎጂ ዳይሬክቶሬት|NULL|2025-08-30 23:24:22
+|2|Lula Mahmud|6000.00|08 - የግዥ፣ ፋይናንስና ንብረት አስተዳደር ዳይሬክቶሬት|NULL|2025-08-30 23:24:22
+|3|Niyya Ali|2000.00|03 - የኦፕሬሽን ዘርፍ ም/ቢ/ሐላፊ|NULL|2025-08-30 23:24:22
+== Table structure for table fuel_transactions
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|owner_id|int(11)|Yes|NULL
+|driver_name|varchar(100)|Yes|NULL
+|plate_number|varchar(20)|Yes|NULL
+|et_month|varchar(20)|Yes|NULL
+|previous_gauge|decimal(10,2)|Yes|NULL
+|current_gauge|decimal(10,2)|Yes|NULL
+|journey_distance|decimal(10,2)|Yes|NULL
+|fuel_price|decimal(10,2)|Yes|NULL
+|refuelable_amount|decimal(10,2)|Yes|NULL
+|total_amount|decimal(15,2)|Yes|NULL
+|new_gauge|decimal(10,2)|Yes|NULL
+|gauge_gap|decimal(10,2)|Yes|NULL
+|date|datetime|Yes|CURRENT_TIMESTAMP
+== Dumping data for table fuel_transactions
+
+|2|10|ali|4-01265|ነሐሴ|0.00|0.00|150.00|120.00|30.00|3600.00|150.00|150.00|2025-08-21 22:29:16
+|3|10|vv|4-01265|ነሐሴ|150.00|150.00|100.00|120.00|20.00|2400.00|250.00|100.00|2025-08-21 22:32:57
+|4|10|driverb|4-01264|ሐምሌ|0.00|0.00|200.00|120.00|40.00|4800.00|200.00|200.00|2025-08-21 22:40:58
+|5|10|ggg|4-01265|ሐምሌ|250.00|250.00|150.00|120.00|30.00|3600.00|400.00|150.00|2025-08-21 22:46:57
+|6|10|hh|4-1237 AF|ሐምሌ|0.00|0.00|150.00|120.00|15.00|1800.00|15.00|15.00|2025-08-22 15:31:06
+|8|11|aliabdela|4-01263 AF|ነሐሴ|0.00|0.00|150.00|120.00|30.00|3600.00|150.00|150.00|2025-08-22 16:42:39
+|9|11|vv|4-01263 AF|ነሐሴ|150.00|150.00|100.00|120.00|20.00|2400.00|250.00|100.00|2025-08-22 16:46:21
+|11|11|a|4-01275 AF|ነሐሴ|0.00|0.00|60.00|120.00|12.00|1440.00|60.00|60.00|2025-08-22 19:44:51
+|12|11| |4-01275 AF|ነሐሴ|60.00|60.00|25.00|120.00|5.00|600.00|85.00|25.00|2025-08-22 19:54:41
+|13|11| |4-01265|ሐምሌ|400.00|400.00|50.00|120.00|10.00|1200.00|450.00|50.00|2025-08-22 20:02:15
+|14|11| |4-01265|ነሐሴ|450.00|450.00|10.00|120.00|2.00|240.00|460.00|10.00|2025-08-22 20:03:12
+|15|10| |4-01264|ነሐሴ|200.00|200.00|25.00|120.00|5.00|600.00|225.00|25.00|2025-08-22 20:08:20
+|16|10| |4-01264|ነሐሴ|225.00|225.00|30.00|120.00|6.00|720.00|255.00|30.00|2025-08-22 20:14:00
+|17|10| |4-01265|ሐምሌ|460.00|460.00|120.00|120.00|24.00|2880.00|580.00|120.00|2025-08-22 20:20:07
+|18|5| |4-01264|ሐምሌ|255.00|255.00|200.00|120.00|40.00|4800.00|455.00|200.00|2025-08-22 20:36:20
+|19|6| |4-01264|ሐምሌ|455.00|455.00|300.00|120.00|60.00|7200.00|755.00|300.00|2025-08-22 20:36:51
+|20|5| |4-01263 AF|ሐምሌ|250.00|250.00|50.00|120.00|10.00|1200.00|300.00|50.00|2025-08-22 20:40:12
+|21|6| | |ሐምሌ|0.00|0.00|100.00|120.00|20.00|2400.00|100.00|100.00|2025-08-22 20:42:20
+|22|6| |4-01264|ሐምሌ|755.00|755.00|250.00|120.00|50.00|6000.00|1005.00|250.00|2025-08-22 21:08:58
+|23|5| |4-01265|ሐምሌ|580.00|580.00|250.00|120.00|50.00|6000.00|830.00|250.00|2025-08-22 23:19:44
+|24|5| |4-01265|ሐምሌ|830.00|830.00|125.00|120.00|25.00|3000.00|955.00|125.00|2025-08-22 23:20:54
+|25|5| |4-01265|ሐምሌ|955.00|955.00|400.00|120.00|80.00|9600.00|1355.00|400.00|2025-08-22 23:29:18
+|26|6| |4-01264|ሐምሌ|1005.00|1005.00|150.00|120.00|30.00|3600.00|1155.00|150.00|2025-08-23 02:48:40
+|27|6|t|4-01265|ሐምሌ|1355.00|1355.00|55.00|120.00|11.00|1320.00|1410.00|55.00|2025-08-23 03:59:56
+|28|6|a|4-01299 AF|ሐምሌ|0.00|0.00|50.00|120.00|10.00|1200.00|50.00|50.00|2025-08-23 04:04:35
+|29|6|ali|4-00471 AF|ሐምሌ|0.00|0.00|35.00|120.00|7.00|840.00|35.00|35.00|2025-08-23 04:07:47
+|30|7|ayalewu eshetu|4-17719 ET|ሐምሌ|0.00|0.00|150.00|120.00|30.00|3600.00|150.00|150.00|2025-08-25 22:42:51
+|31|7|ay|4-17719 ET|ሐምሌ|150.00|150.00|30.00|120.00|6.00|720.00|180.00|30.00|2025-08-25 22:45:12
+|32|7|abdela|4-1234567|ሐምሌ|0.00|0.00|150.00|120.00|30.00|3600.00|150.00|150.00|2025-08-27 05:17:31
+|33|7|lula|4-01250 AF|ሐምሌ|0.00|0.00|50.00|120.00|10.00|1200.00|50.00|50.00|2025-08-27 05:18:19
+|34|7|Niyya|4-01203|ሐምሌ|0.00|0.00|15.00|120.00|3.00|360.00|15.00|15.00|2025-08-28 00:53:06
+|35|6|aa|4-01283 AF|ሐምሌ|0.00|0.00|300.00|120.00|60.00|7200.00|300.00|300.00|2025-08-29 14:51:44
+|36|6|ff|4-01198 AF|ሐምሌ|0.00|0.00|10.00|120.00|2.00|240.00|10.00|10.00|2025-08-29 15:21:24
+|37|5|AAAA|4-01275 AF|መስከረም|85.00|85.00|25.00|120.00|5.00|600.00|110.00|25.00|2025-09-02 05:29:37
+== Table structure for table perdium_transactions
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|employee_id|int(11)|No|
+|budget_owner_id|int(11)|No|
+|budget_code_id|int(11)|No|
+|city_id|int(11)|No|
+|perdium_rate|decimal(10,2)|No|
+|total_days|int(11)|No|
+|departure_date|date|No|
+|arrival_date|date|No|
+|total_amount|decimal(10,2)|No|
+|et_month|varchar(20)|Yes|NULL
+|created_at|timestamp|No|CURRENT_TIMESTAMP
+== Dumping data for table perdium_transactions
+
+|1|1|5|6|9|724.00|10|2025-09-01|2025-09-10|6950.40|ነሐሴ|2025-08-31 05:36:25
+|2|2|5|6|1|395.00|10|2025-09-01|2025-09-10|3792.00|ነሐሴ|2025-08-31 05:42:18
+|3|1|5|6|9|724.00|25|2025-09-02|2025-09-26|17810.40|መስከረም|2025-09-01 13:49:49
+|4|3|5|6|3|344.00|5|2025-09-02|2025-09-06|1582.40|ነሐሴ|2025-09-02 01:19:49
+|5|2|6|6|4|367.00|5|2025-09-02|2025-09-06|1688.20|ነሐሴ|2025-09-02 01:23:39
+== Table structure for table transactions
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|**owner_id**|int(11)|Yes|NULL
+|**code_id**|int(11)|Yes|NULL
+|employee_name|varchar(100)|Yes|NULL
+|ordered_by|varchar(100)|Yes|NULL
+|reason|mediumtext|Yes|NULL
+|created_by|varchar(100)|Yes|NULL
+|**amount**|decimal(15,2)|Yes|NULL
+|**date**|datetime|Yes|CURRENT_TIMESTAMP
+|**et_month**|varchar(20)|Yes|NULL
+|quarter|int(11)|Yes|NULL
+|remaining_month|decimal(15,2)|Yes|NULL
+|remaining_quarter|decimal(15,2)|Yes|NULL
+|remaining_year|decimal(15,2)|Yes|NULL
+== Dumping data for table transactions
+
+|1|10|10|yftd5d5|ugy|Yfyfugu|admin|1000.00|2025-09-02 15:38:19|ነሐሴ|1|11000.00|200.00|11000.00
+== Table structure for table users
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|**username**|varchar(50)|Yes|NULL
+|name|varchar(100)|Yes|NULL
+|password_hash|varchar(255)|Yes|NULL
+|role|enum(&#039;admin&#039;, &#039;officer&#039;)|Yes|NULL
+|profile_picture|varchar(255)|Yes|NULL
+== Dumping data for table users
+
+|1|admin|Ali Abdela|$2y$10$RYvzdURJXXYtC61mnCZrK.jjFvZa4GBglg9Yq9Wzafs2YtJQ4hJZi|admin|uploads/b843ed9daa37f608a986bb1828cbfae5.png
+|2|officer|Budget Officer|$2y$10$qw4.EExY9yooLTAa0DEjVOFZ1Yan5L9/5W1NS6yRVTakjQw03SIwy|officer|NULL
+|5|superadmin|Super Admin|$2y$10$3cqATTRmoVykR4k5okNPNuuw0fdhTxzoJ2cm.UpX.EyX6/RoxCwpu|admin|NULL
+== Table structure for table vehicles
+
+|------
+|Column|Type|Null|Default
+|------
+|//**id**//|int(11)|No|
+|model|varchar(50)|No|
+|plate_no|varchar(50)|No|
+|chassis_no|varchar(50)|Yes|NULL
+== Dumping data for table vehicles
+
+|1|ሀይሎክስ|4-01265|AHTKB8CD60298739
+|2|ሀይሎክስ|4-01264|AHTKB8CD302987832
+|3|ሀይሎ ክች|4-01263 AF|AHTKB8CD702987834
+|4|ሀይሎክስ|4-01274 AF|NULL
+|5|ሀይሎክስ|4-01275 AF|NULL
+|6|ሀይሎክስ|4-01203|NULL
+|7|ሀይሎክስ|4-01283 AF|JTEEB71J30F029582
+|8|ሀይሎክስ|4-01198 AF|JTEEB71J6014901
+|9|ሀይሎክስ|4-00471 AF|NULL
+|10|ሀይሎክስ|4-1237 AF|JTEEB71J30F026486
+|11|ላንድክሩዘር|4-1238 AF|JTEEB71J0F026485
+|12|ሃይሎክች|4-01066 AF|JTRB71j00F006200
+|13|ላንድክሩዘር|4-01299 AF|AHTFR22G006106874
+|14| |4-01302 AF|JTEBH9FJ80K198638
+|15|ላንድክሩዘር|4-01301 AF|JTEEB71J9041570
+|16| |4-01184 AF|AHTKB8CD702984139
+|17|ላንድክሩዘር|4-01250 AF|JTEEB71J30F024351
+|18| |4-01248 AF|JTEEB71J00F024291
+|19|ላንድክሩዘር|4-01249 AF|JTEEB71J70F024322
+|20|አምቡላንስ|4-01068 AF|JTERB71J70F004847
+|21|አምቡላንስ|4-01065 AF|JTERB71J20F005145
+|22| |4-01303|NULL
+|23|ሃርድቶፕ|4-01247 AF|JTEEB71J60F024294
+|24|ሃርድቶፕ|4-01246 AF|JTEEB71J70F024319
+|25|ሃርድቶፕ|4-01245 AF|JTEEB71J30F024317
+|26|ሃርድቶፕ|4-01244 AF|JTEEB71J30F024298
+|27|ሃርድቶፕ|4-01243 AF|JTEEB71J00F024324
+|28|ሃርድቶፕ|4-01241 AF|JTEEB7160F024313
+|29|ሃርድቶፕ|4-01242 AF|JTEEB71J10F024350
+|30|ሃርድቶፕ|4-01203 AF|JTEEB71J00F018018524
+|31|ሃርድቶፕ|4-00910 AF|JTEEB71J607040487
+|32|ሃርድቶፕ|4-00912 AF|JTEEB71J507040562
+|33|ላንድክሩዘር|4-05621|JTEEB71J907031119
+|34|ቶያታ ሃርድቶፕ|4-32792|JTEEB71J0014550
+|35|ቶያታ ሃርድቶፕ|4-01259 AF|JTERB71X0F024221
+|36|ሃርድቶፕ|4-00903 AF|JTEEB71J307043198
+|37|ሃርድቶፕ|4-00909 AF|JTEEB71J507040559
+|38|ሃርድቶፕ|4-00906 AF|JTEEB71307043220
+|39|ሃርድቶፕ|4-00908 AF|JTEEB71J507040643
+|40|ሃርድቶፕ|4-00911 AF|JTEEB71J607040540
+|41|ሃርድቶፕ|4-00904 AF|JTEEB7J307043248
+|42|ሃርድቶፕ|4-00907 AF|JTEEB71J507043199
+|43|ሃርድቶፕ|4-00905 AF|JTEEB71507043168
+|44|ሃርድቶፕ|4-00902 AF|JTEEB71J407043226
+|45|ላንድክሩዘር|4-17719 ET| 
+|48|TATA Service Bus|4-1234567| 

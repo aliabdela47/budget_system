@@ -1,0 +1,185 @@
+/* SweetAlert2 Custom Global Styling */
+/* Rainbow Gradient Progress Bar */
+.rainbow-progress-bar {
+    background: linear-gradient(
+        90deg,
+        #ff0000 0%,    /* Red */
+        #ff8000 20%,   /* Orange */
+        #ffff00 40%,   /* Yellow */
+        #00ff00 60%,   /* Green */
+        #0000ff 80%,   /* Blue */
+        #8000ff 100%   /* Purple */
+    ) !important;
+    height: 6px !important;
+    border-radius: 0 0 10px 10px !important;
+    animation: rainbow-flow 2s linear infinite !important;
+}
+
+@keyframes rainbow-flow {
+    0% {
+        background-position: 0% 50%;
+    }
+    100% {
+        background-position: 100% 50%;
+    }
+}
+
+/* Enhanced Notification Styling */
+.enhanced-notification {
+    background: white !important;
+    border: none !important;
+    border-radius: 16px !important;
+    box-shadow: 
+        0 20px 40px rgba(0, 0, 0, 0.1),
+        0 8px 24px rgba(0, 0, 0, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.8) !important;
+    backdrop-filter: blur(10px) !important;
+    border: 1px solid rgba(255, 255, 255, 0.3) !important;
+    padding: 20px !important;
+}
+
+/* Success Notification */
+.success-notification {
+    border-left: 6px solid #10b981 !important;
+    background: linear-gradient(135deg, #ffffff 0%, #f0fdf4 100%) !important;
+}
+
+.success-notification .swal2-icon {
+    border-color: #10b981 !important;
+    color: #10b981 !important;
+}
+
+/* Error Notification */
+.error-notification {
+    border-left: 6px solid #ef4444 !important;
+    background: linear-gradient(135deg, #ffffff 0%, #fef2f2 100%) !important;
+}
+
+.error-notification .swal2-icon {
+    border-color: #ef4444 !important;
+    color: #ef4444 !important;
+}
+
+/* Warning Notification */
+.warning-notification {
+    border-left: 6px solid #f59e0b !important;
+    background: linear-gradient(135deg, #ffffff 0%, #fffbeb 100%) !important;
+}
+
+.warning-notification .swal2-icon {
+    border-color: #f59e0b !important;
+    color: #f59e0b !important;
+}
+
+/* Info Notification */
+.info-notification {
+    border-left: 6px solid #3b82f6 !important;
+    background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%) !important;
+}
+
+.info-notification .swal2-icon {
+    border-color: #3b82f6 !important;
+    color: #3b82f6 !important;
+}
+
+/* Enhanced Icon Styling */
+.enhanced-icon {
+    width: 60px !important;
+    height: 60px !important;
+    border-width: 3px !important;
+    border-radius: 50% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    margin: 0 auto 16px auto !important;
+}
+
+.enhanced-icon .swal2-icon-content {
+    font-size: 28px !important;
+    font-weight: 900 !important;
+}
+
+/* Title Styling */
+.enhanced-title {
+    font-size: 20px !important;
+    font-weight: 700 !important;
+    margin-bottom: 8px !important;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    background-clip: text !important;
+}
+
+/* Text Styling */
+.enhanced-text {
+    font-size: 14px !important;
+    line-height: 1.5 !important;
+    color: #4b5563 !important;
+    margin-bottom: 0 !important;
+}
+
+/* Close Button */
+.enhanced-close {
+    position: absolute !important;
+    top: 12px !important;
+    right: 12px !important;
+    width: 32px !important;
+    height: 32px !important;
+    border-radius: 50% !important;
+    background: rgba(0, 0, 0, 0.05) !important;
+    color: #6b7280 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    transition: all 0.3s ease !important;
+}
+
+.enhanced-close:hover {
+    background: rgba(0, 0, 0, 0.1) !important;
+    transform: rotate(90deg) !important;
+}
+
+/* Notification Container Positioning */
+.swal2-container.swal2-top-end {
+    padding: 20px !important;
+}
+
+/* Mobile Responsiveness */
+@media (max-width: 768px) {
+    .enhanced-notification {
+        width: 90% !important;
+        margin: 0 auto !important;
+    }
+    
+    .enhanced-icon {
+        width: 50px !important;
+        height: 50px !important;
+    }
+    
+    .enhanced-title {
+        font-size: 18px !important;
+    }
+}
+
+/* Animation improvements */
+@keyframes slideInRight {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+@keyframes slideOutRight {
+    from {
+        transform: translateX(0);
+        opacity: 1;
+    }
+    to {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+}

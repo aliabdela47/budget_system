@@ -1,0 +1,248 @@
+<?php
+session_start();
+include 'includes/db.php';
+include 'includes/functions.php';
+if (!isset($_SESSION['user_id']) || $_SESSION['role'] != 'admin') {
+    header('Location: dashboard.php');
+    exit;
+}
+
+$owners = $pdo->query("SELECT * FROM budget_owners")->fetchAll();
+$codes = $pdo->query("SELECT * FROM budget_codes")->fetchAll();
+
+// Fetch budgets based on selected owner and code
+$selected_owner_id = isset($_POST['owner_id']) ? $_POST['owner_id'] : (isset($_GET['owner_id']) ? $_GET['owner_id'] : null);
+$selected_code_id = isset($_POST['code_id']) ? $_POST['code_id'] : (isset($_GET['code_id']) ? $_GET['code_id'] : null);
+$budget_query = "SELECT b.*, o.code AS owner_code, o.name AS owner_name, c.code AS budget_code, c.name AS budget_name 
+                 FROM budgets b 
+                 JOIN budget_owners o ON b.owner_id = o.id 
+                 JOIN budget_codes c ON b.code_id = c.id";
+$params = [];
+if ($selected_owner_id && $selected_code_id) {
+    $budget_query .= " WHERE b.owner_id = ? AND b.code_id = ?";
+    $params = [$selected_owner_id, $selected_code_id];
+}
+$stmt = $pdo->prepare($budget_query);
+$stmt->execute($params);
+$budgets = $stmt->fetchAll();
+
+$budget = null;
+if (isset($_GET['action']) && $_GET['action'] == 'edit' && isset($_GET['id'])) {
+    $stmt = $pdo->prepare("SELECT * FROM budgets WHERE id = ?");
+    $stmt->execute([$_GET['id']]);
+    $budget = $stmt->fetch();
+}
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    $owner_id = $_POST['owner_id'];
+    $code_id = $_POST['code_id'];
+    $adding_date = $_POST['adding_date'];
+    $et_info = getEtMonthAndQuarter($adding_date);
+    $month = $_POST['month'] ?? '';
+    $quarter = $quarterMap[$month] ?? 0;
+    $yearly_amount = (float)($_POST['yearly_amount'] ?? 0);
+    $monthly_amount = (float)($_POST['monthly_amount'] ?? 0);
+    $year = date('Y', strtotime($adding_date)) - 8;
+
+    $pdo->beginTransaction();
+    try {
+        // Fetch existing yearly budget for validation
+        $stmt = $pdo->prepare("SELECT id, yearly_amount, remaining_yearly FROM budgets WHERE owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0");
+        $stmt->execute([$owner_id, $code_id, $year]);
+        $yearly_budget = $stmt->fetch();
+
+        if (isset($_POST['id']) && $_POST['action'] == 'update') {
+            // Update budget
+            $stmt = $pdo->prepare("UPDATE budgets SET owner_id = ?, code_id = ?, adding_date = ?, year = ?, yearly_amount = ?, month = ?, monthly_amount = ?, quarter = ? WHERE id = ?");
+            $stmt->execute([$owner_id, $code_id, $adding_date, $year, $yearly_amount, $month, $monthly_amount, $quarter, $_POST['id']]);
+            $message = 'Budget updated';
+        } else {
+            if ($yearly_amount > 0) {
+                if ($yearly_budget) {
+                    $message = 'Yearly budget already added for this owner and code.';
+                } else {
+                    $stmt = $pdo->prepare("INSERT INTO budgets (owner_id, code_id, adding_date, year, yearly_amount, month, monthly_amount, quarter, remaining_yearly, remaining_monthly, remaining_quarterly) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                    $stmt->execute([$owner_id, $code_id, $adding_date, $year, $yearly_amount, '', 0, 0, $yearly_amount, 0, 0]);
+                    $message = 'Yearly budget added successfully.';
+                }
+            } elseif ($monthly_amount > 0) {
+                if (!$yearly_budget) {
+                    $message = 'No yearly budget exists. Add yearly budget first.';
+                } else {
+                    if ($monthly_amount > $yearly_budget['remaining_yearly']) {
+                        $message = 'Monthly amount exceeds remaining yearly budget.';
+                        
+                        $pdo->exec("LOCK TABLES budgets WRITE"); //added
+                    } 
+                    
+                    else {
+                        $new_remaining_yearly = $yearly_budget['remaining_yearly'] - $monthly_amount;
+                        $stmt = $pdo->prepare("INSERT INTO budgets (owner_id, code_id, adding_date, year, yearly_amount, month, monthly_amount, quarter, remaining_yearly, remaining_monthly, remaining_quarterly) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                        $stmt->execute([$owner_id, $code_id, $adding_date, $year, 0, $month, $monthly_amount, $quarter, $new_remaining_yearly, $monthly_amount, $monthly_amount * 3]);
+                        $stmt = $pdo->prepare("UPDATE budgets SET remaining_yearly = ? WHERE id = ?");
+                        $stmt->execute([$new_remaining_yearly, $yearly_budget['id']]);
+                        $message = 'Monthly budget added successfully.';
+                    }
+                }
+            } else {
+                $message = 'Please enter a yearly or monthly amount.';
+            }
+        }
+        $pdo->commit();
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $message = 'Error: ' . $e->getMessage();
+    }
+}
+
+if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id'])) {
+    $stmt = $pdo->prepare("SELECT owner_id, code_id, year, monthly_amount, remaining_yearly FROM budgets WHERE id = ?");
+    $stmt->execute([$_GET['id']]);
+    $budget = $stmt->fetch();
+
+    $pdo->beginTransaction();
+    try {
+        if ($budget['monthly_amount'] > 0) {
+            $stmt = $pdo->prepare("UPDATE budgets SET remaining_yearly = remaining_yearly + ? WHERE owner_id = ? AND code_id = ? AND year = ? AND monthly_amount = 0");
+            $stmt->execute([$budget['monthly_amount'], $budget['owner_id'], $budget['code_id'], $budget['year']]);
+        }
+        $stmt = $pdo->prepare("DELETE FROM budgets WHERE id = ?");
+        $stmt->execute([$_GET['id']]);
+        $pdo->commit();
+        $message = 'Budget deleted';
+        header('Location: budget_adding.php?owner_id=' . $budget['owner_id'] . '&code_id=' . $budget['code_id']);
+        exit;
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $message = 'Error deleting budget: ' . $e->getMessage();
+    }
+}
+?>
+
+
+  
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Budget Adding - Budget System</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="css/styles.css">
+    <script src="js/scripts.js"></script>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="dashboard.php">Budget System</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item"><a class="nav-link" href="budget_adding.php">Budget Adding</a></li>
+                    <li class="nav-item"><a class="nav-link" href="settings_owners.php">Settings</a></li>
+                    <li class="nav-item"><a class="nav-link" href="transaction.php">Transaction</a></li>
+                    <li class="nav-item"><a class="nav-link" href="fuel_management.php">Fuel Management</a></li>
+                    <li class="nav-item"><a class="nav-link" href="users_management.php">Users Management</a></li>
+                    <li class="nav-item"><a class="nav-link" href="logout.php">Logout</a></li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+    <div class="container">
+        <div class="card mt-4">
+            <div class="card-body">
+                <h2 class="card-title">Budget Adding Form</h2>
+                <?php if (isset($message)): ?>
+                    <div class="alert alert-info"><?php echo $message; ?></div>
+                <?php endif; ?>
+                <form method="post">
+                    <?php if ($budget): ?>
+                        <input type="hidden" name="id" value="<?php echo $budget['id']; ?>">
+                        <input type="hidden" name="action" value="update">
+                    <?php endif; ?>
+                    <div class="mb-3">
+                        <label class="form-label">Budget Adding Date</label>
+                        <input type="date" id="adding_date" name="adding_date" class="form-control" value="<?php echo $budget ? $budget['adding_date'] : date('Y-m-d'); ?>" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Budget Owners Code</label>
+                        <select name="owner_id" class="form-control" required>
+                            <?php foreach ($owners as $o): ?>
+                                <option value="<?php echo $o['id']; ?>" <?php echo $budget && $budget['owner_id'] == $o['id'] ? 'selected' : ''; ?>>
+                                    <?php echo $o['code'] . ' - ' . $o['name']; ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <small class="form-text">Selected Owner: <span id="selected_owner"><?php echo $budget ? ($owners[array_search($budget['owner_id'], array_column($owners, 'id'))]['name']) : ''; ?></span></small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Budget Code</label>
+                        <select name="code_id" class="form-control" required>
+                            <?php foreach ($codes as $c): ?>
+                                <option value="<?php echo $c['id']; ?>" <?php echo $budget && $budget['code_id'] == $c['id'] ? 'selected' : ''; ?>>
+                                    <?php echo $c['code'] . ' - ' . $c['name']; ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <small class="form-text">Selected Code: <span id="selected_code"><?php echo $budget ? ($codes[array_search($budget['code_id'], array_column($codes, 'id'))]['name']) : ''; ?></span></small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Select Month Info</label>
+                        <select id="month" name="month" class="form-control" onchange="updateQuarter()" required>
+                            <?php foreach ($etMonths as $m): ?>
+                                <option value="<?php echo $m; ?>" <?php echo $budget && $budget['month'] == $m ? 'selected' : ''; ?>><?php echo $m; ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Monthly Amount</label>
+                        <input type="number" step="0.01" name="monthly_amount" class="form-control" value="<?php echo $budget ? $budget['monthly_amount'] : ''; ?>">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Yearly Amount</label>
+                        <input type="number" step="0.01" name="yearly_amount" class="form-control" value="<?php echo $budget ? $budget['yearly_amount'] : ''; ?>">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" id="quarter_label">Quarter: Calculating...</label>
+                    </div>
+                    <button type="submit" class="btn btn-primary"><?php echo $budget ? 'Update' : 'Save'; ?></button>
+                    <button type="button" class="btn btn-info" onclick="window.print()">Print</button>
+                </form>
+                <h3 class="mt-4">Existing Budgets</h3>
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Owner</th>
+                            <th>Code</th>
+                            <th>Month</th>
+                            <th>Monthly Amount</th>
+                            <th>Yearly Amount</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($budgets as $b): ?>
+                            <tr>
+                                <td><?php echo $b['id']; ?></td>
+                                <td><?php echo $b['owner_code'] . ' - ' . $b['owner_name']; ?></td>
+                                <td><?php echo $b['budget_code'] . ' - ' . $b['budget_name']; ?></td>
+                                <td><?php echo $b['month']; ?></td>
+                                <td><?php echo number_format($b['monthly_amount'], 2); ?></td>
+                                <td><?php echo number_format($b['yearly_amount'], 2); ?></td>
+                                <td>
+                                    <a href="?action=edit&id=<?php echo $b['id']; ?>" class="btn btn-secondary btn-sm">Edit</a>
+                                    <a href="?action=delete&id=<?php echo $b['id']; ?>" class="btn btn-danger btn-sm" onclick="return confirm('Are you sure?')">Delete</a>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once 'db.php';
+require_once 'functions.php';
+if (!isset($_SESSION['user_id']) && basename($_SERVER['PHP_SELF']) !== 'index.php') {
+    header('Location: index.php');
+    exit;
+}
+// Add other shared includes here
+?>

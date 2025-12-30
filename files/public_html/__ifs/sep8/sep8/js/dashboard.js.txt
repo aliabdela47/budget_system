@@ -1,0 +1,11 @@
+document.addEventListener('DOMContentLoaded', () => {
+    const sidebar = document.querySelector('.sidebar');
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'btn btn-primary sidebar-toggle';
+    toggleBtn.innerHTML = '<i class="fas fa-bars"></i>';
+    document.querySelector('.main-content').prepend(toggleBtn);
+
+    toggleBtn.addEventListener('click', () => {
+        sidebar.classList.toggle('active');
+    });
+});
